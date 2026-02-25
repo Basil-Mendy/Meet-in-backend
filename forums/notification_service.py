@@ -43,6 +43,9 @@ class NotificationService:
         'MEMBER_ROLE_ASSIGNED': 'members',
         'MEMBER_ROLE_REMOVED': 'members',
         'MEMBER_APPROVED': 'settings',
+        'FORUM_JOIN_REQUEST_PENDING': 'settings',
+        'FORUM_JOIN_REQUEST_APPROVED': 'settings',
+        'FORUM_JOIN_REQUEST_REJECTED': 'settings',
         'FORUM_INFO_UPDATED': 'about',
         'ANNOUNCEMENT_CREATED': 'announcements',
         'POLL_CREATED': 'polls',
@@ -98,6 +101,18 @@ class NotificationService:
         'MEMBER_APPROVED': {
             'title_template': 'Membership approved in {forum_name}',
             'message_template': 'Your membership has been approved',
+        },
+        'FORUM_JOIN_REQUEST_PENDING': {
+            'title_template': 'New join request in {forum_name}',
+            'message_template': '{user_name} is requesting to join the forum',
+        },
+        'FORUM_JOIN_REQUEST_APPROVED': {
+            'title_template': 'Join request approved in {forum_name}',
+            'message_template': 'Your request to join {forum_name} has been approved',
+        },
+        'FORUM_JOIN_REQUEST_REJECTED': {
+            'title_template': 'Join request rejected in {forum_name}',
+            'message_template': 'Your request to join {forum_name} has been rejected',
         },
         'FORUM_INFO_UPDATED': {
             'title_template': '{forum_name} information updated',
@@ -156,6 +171,17 @@ class NotificationService:
         # Determine tab if not provided
         if not tab:
             tab = NotificationService.NOTIFICATION_TAB_MAP.get(notification_type, 'feed')
+            print(f"[Notification] Resolved tab from notification_type: {notification_type} -> {tab}")
+        else:
+            # Ensure tab is lowercase and valid
+            tab = str(tab).lower().strip()
+            print(f"[Notification] Using provided tab: {tab}")
+        
+        # Validate tab value
+        valid_tabs = ['feed', 'meetings', 'payments', 'disbursements', 'members', 'about', 'announcements', 'polls', 'settings']
+        if tab not in valid_tabs:
+            print(f"[Notification] WARNING: Invalid tab '{tab}', defaulting to 'feed'")
+            tab = 'feed'
         
         # Create the notification
         with transaction.atomic():
@@ -169,16 +195,17 @@ class NotificationService:
                 object_id=object_id or '',
                 is_read=False,
             )
+            print(f"[Notification] Created notification #{notification.id}: tab={notification.tab}")
             
-            # Send push and email based on preferences
-            NotificationService._send_notification(
+            # Send push and email based on preferences and broadcast once
+            should_push = NotificationService._send_notification(
                 notification=notification,
                 send_push=send_push,
                 send_email=send_email,
             )
-            
-            # Broadcast via WebSocket
-            NotificationService._broadcast_notification(notification)
+
+            # Broadcast via WebSocket exactly once (mark as push if push was requested)
+            NotificationService._broadcast_notification(notification, is_push=bool(should_push))
         
         return notification
 
@@ -232,7 +259,7 @@ class NotificationService:
         
         notifications = []
         with transaction.atomic():
-            for user in target_users:
+            for i, user in enumerate(target_users, 1):
                 try:
                     notification = NotificationService.create_notification(
                         forum=forum,
@@ -247,12 +274,11 @@ class NotificationService:
                         send_email=send_email,
                     )
                     notifications.append(notification)
-                    print(f"[Notification] ✓ Created notification for {user.email}")
+                    print(f"[Notification] ✓ [{i}] Created notification for {user.email}: type={notification_type}, tab={notification.tab}")
                 except Exception as e:
-                    print(f"[Notification] ✗ Failed to create notification for {user.email}: {e}")
+                    print(f"[Notification] ✗ [{i}] Failed to create notification for {user.email}: {e}")
         
         print(f"[Notification] Created {len(notifications)} notifications")
-        return notifications
         return notifications
 
     @staticmethod
@@ -303,21 +329,20 @@ class NotificationService:
         
         # Check push preference (default True)
         should_push = send_push if send_push is not None else getattr(prefs, f'{pref_prefix}_push', True)
-        
+
         # Check email preference (default False for most, True for meetings/payments)
         should_email = send_email if send_email is not None else getattr(
-            prefs, 
-            f'{pref_prefix}_email', 
+            prefs,
+            f'{pref_prefix}_email',
             pref_prefix in ['meetings', 'payments', 'announcements']
         )
-        
-        # Send push notification
-        if should_push:
-            NotificationService._send_push_notification(notification)
-        
-        # Send email notification
+
+        # Send email notification if required
         if should_email:
             NotificationService._send_email_notification(notification)
+
+        # Return whether push should be sent so caller can broadcast exactly once
+        return bool(should_push)
 
     @staticmethod
     def _send_push_notification(notification: Notification) -> None:

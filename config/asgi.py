@@ -44,7 +44,11 @@ from channels.routing import URLRouter
 def exception_handling_asgi(asgi_app):
     async def wrapped(scope, receive, send):
         try:
-            sys.stderr.write(f"[ASGI-WRAPPED] scope type: {scope['type']}, path: {scope.get('path', 'N/A')}\n")
+            print(f"\n{'='*60}")
+            print(f"[ASGI-WRAPPED] SCOPE TYPE: {scope['type']}")
+            print(f"[ASGI-WRAPPED] PATH: {scope.get('path', 'NO_PATH')}")
+            print(f"[ASGI-WRAPPED] QUERY STRING: {scope.get('query_string', b'').decode()[:100]}")
+            print(f"{'='*60}\n")
             sys.stderr.flush()
             return await asgi_app(scope, receive, send)
         except Exception as e:

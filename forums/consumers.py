@@ -43,19 +43,10 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
         """Handle WebSocket connection - authenticate via JWT token"""
-        # Absolute first thing - write to file
-        import os
-        from pathlib import Path
-        log_file = Path(__file__).parent.parent / "websocket_connect.log"
-        
-        try:
-            with open(log_file, "a") as f:
-                f.write(f"\n{'='*60}\n[CONNECT] METHOD CALLED\n{'='*60}\n")
-                f.flush()
-        except Exception as e:
-            pass
-        
-        print("[WS-CONNECT] METHOD CALLED")
+        # Initialize attributes first to prevent errors if connect fails
+        self.user = None
+        self.user_id = None
+        self.room_name = None
         
         try:
             # Get token from query string
@@ -115,12 +106,15 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         """Handle WebSocket disconnection"""
-        if self.room_name:
+        # Only try to remove from group if room_name was set (i.e., connection succeeded)
+        if hasattr(self, 'room_name') and self.room_name:
             await self.channel_layer.group_discard(
                 self.room_name,
                 self.channel_name
             )
-        logger.info(f"[WS] User {self.user_id} disconnected (code: {close_code})")
+            print(f"[WS] ✗ User disconnected from notifications")
+            if hasattr(self, 'user_id'):
+                logger.info(f"[WS] User {self.user_id} disconnected (code: {close_code})")
 
     async def receive(self, text_data):
         """

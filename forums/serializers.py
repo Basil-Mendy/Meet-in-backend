@@ -6,9 +6,9 @@ from .models import (
     Meeting, MeetingParticipant, MeetingMinute,
     ForumMeeting, MeetingAttendee,
     ForumPayment, ForumPaymentSubmission,
-    Announcement, AnnouncementRecipient, AnnouncementRead,
+    Announcement, AnnouncementRecipient, AnnouncementRead, AnnouncementAttachment,
     Poll, PollGroup, PollOption, PollVote,
-    Notification, UserNotificationPreference
+    Notification, UserNotificationPreference, ForumActivityHistory
 )
 
 User = get_user_model()
@@ -300,6 +300,8 @@ class AnnouncementSerializer(serializers.ModelSerializer):
     created_by_email = serializers.CharField(source="created_by.email", read_only=True)
     is_read = serializers.SerializerMethodField()
     read_count = serializers.SerializerMethodField()
+    recipients = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
 
     class Meta:
         model = Announcement
@@ -307,7 +309,7 @@ class AnnouncementSerializer(serializers.ModelSerializer):
             "id", "forum", "title", "message", "announcement_type", 
             "created_by", "created_by_name", "created_by_email",
             "created_at", "is_archived", "archived_at",
-            "is_read", "read_count", "save_to_forum_feed"
+            "is_read", "read_count", "recipients", "attachments"
         ]
         read_only_fields = ["id", "forum", "created_by", "created_by_name", "created_by_email", "created_at", "archived_at"]
 
@@ -320,6 +322,30 @@ class AnnouncementSerializer(serializers.ModelSerializer):
     def get_read_count(self, obj):
         return obj.reads.count()
 
+    def get_recipients(self, obj):
+        # Return a lightweight summary: either All (for GENERAL) or count/preview for TARGETED
+        if obj.announcement_type == 'GENERAL':
+            return {"type": "All Members"}
+        # TARGETED
+        recs = obj.recipients.select_related('user')[:10]
+        return {
+            "type": "Selected Members",
+            "count": obj.recipients.count(),
+            "preview": [{"id": str(r.user.id), "name": r.user.get_full_name(), "email": r.user.email} for r in recs]
+        }
+
+    def get_attachments(self, obj):
+        return [
+            {
+                "id": str(a.id),
+                "filename": a.filename,
+                "url": a.file.url if a.file else None,
+                "size": a.size,
+                "uploaded_at": a.uploaded_at,
+            }
+            for a in obj.attachments.all()
+        ]
+
 
 class AnnouncementRecipientSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source="user.email", read_only=True)
@@ -327,8 +353,15 @@ class AnnouncementRecipientSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AnnouncementRecipient
-        fields = ["id", "user", "user_email", "user_name", "email_sent_at", "email_delivery_status", "email_error"]
-        read_only_fields = ["id", "user_email", "user_name", "email_sent_at", "email_delivery_status", "email_error"]
+        fields = ["id", "user", "user_email", "user_name", "added_at"]
+        read_only_fields = ["id", "user_email", "user_name", "added_at"]
+
+
+class AnnouncementAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AnnouncementAttachment
+        fields = ["id", "filename", "file", "size", "uploaded_by", "uploaded_at"]
+        read_only_fields = ["id", "uploaded_by", "uploaded_at", "size"]
 
 
 # ==================== POLL SERIALIZERS ====================
@@ -851,3 +884,22 @@ class UserNotificationPreferenceSerializer(serializers.ModelSerializer):
             "created_at", "updated_at"
         ]
         read_only_fields = ["id", "user", "created_at", "updated_at"]
+
+
+# ==================== FORUM ACTIVITY HISTORY ====================
+class ForumActivityHistorySerializer(serializers.ModelSerializer):
+    """Serialize forum activity history for general records"""
+    performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True)
+    performed_by_email = serializers.CharField(source="performed_by.email", read_only=True)
+    activity_type_display = serializers.CharField(source="get_activity_type_display", read_only=True)
+    tab_display = serializers.CharField(source="get_tab_display", read_only=True)
+    
+    class Meta:
+        model = ForumActivityHistory
+        fields = [
+            "id", "forum", "performed_by", "performed_by_name", "performed_by_email",
+            "activity_type", "activity_type_display", "tab", "tab_display",
+            "title", "description", "object_id", "object_type", "metadata",
+            "created_at"
+        ]
+        read_only_fields = fields

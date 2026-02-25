@@ -28,10 +28,12 @@ from .views import (
     ForumPaymentViewSet,
     ForumPaymentSubmissionViewSet,
     AnnouncementViewSet,
+    AnnouncementAttachmentDownloadView,
     PollGroupViewSet,
     PollViewSet,
     NotificationViewSet,
     UserNotificationPreferenceView,
+    ForumActivityHistoryView,
 )
 from .membership_views import ForumMembersViewSet
 from .about_views import (
@@ -71,6 +73,7 @@ urlpatterns = [
     path("<uuid:forum_id>/about/documents/", ForumDocumentViewSet.as_view({"get": "list", "post": "create"}), name="forum-documents"),
     path("<uuid:forum_id>/about/documents/<uuid:pk>/", ForumDocumentViewSet.as_view({"delete": "destroy"}), name="forum-document-detail"),
     path("<uuid:forum_id>/about/bank-account/", BankAccountView.as_view(), name="forum-bank-account"),
+    path("<uuid:forum_id>/about/general-records/", ForumActivityHistoryView.as_view(), name="forum-general-records"),
 
     # Forum Posts
     path("<uuid:forum_id>/posts/", ForumPostViewSet.as_view({"get": "list", "post": "create"}), name="forum-posts"),
@@ -102,6 +105,7 @@ urlpatterns = [
     path("<uuid:forum_id>/announcements/<uuid:pk>/mark-as-read/", AnnouncementViewSet.as_view({"post": "mark_as_read"}), name="announcement-mark-read"),
     path("<uuid:forum_id>/announcements/<uuid:pk>/archive/", AnnouncementViewSet.as_view({"patch": "archive"}), name="announcement-archive"),
     path("<uuid:forum_id>/announcements/recipients/", AnnouncementViewSet.as_view({"get": "recipients"}), name="announcement-recipients"),
+    path("<uuid:forum_id>/announcements/attachments/<uuid:attachment_id>/", AnnouncementAttachmentDownloadView.as_view(), name="announcement-attachment-download"),
 
     # Poll Groups
     path("<uuid:forum_id>/poll-groups/", PollGroupViewSet.as_view({"get": "list", "post": "create"}), name="forum-poll-groups"),
@@ -125,6 +129,8 @@ urlpatterns = [
     path("notifications/mark-as-read/", NotificationViewSet.as_view({"post": "mark_as_read"}), name="mark-notifications-read"),
     path("notifications/clear-forum/", NotificationViewSet.as_view({"post": "clear_forum_notifications"}), name="clear-forum-notifications"),
     path("notifications/clear-tab/", NotificationViewSet.as_view({"post": "clear_tab_notifications"}), name="clear-tab-notifications"),
+    path("notifications/<uuid:pk>/mark-read/", NotificationViewSet.as_view({"post": "mark_single_as_read"}), name="mark-notification-read"),
+    path("notifications/<uuid:pk>/", NotificationViewSet.as_view({"delete": "destroy"}), name="delete-notification"),
     path("<uuid:forum_id>/notifications/", NotificationViewSet.as_view({"get": "forum_notifications"}), name="forum-notifications"),
     path("notification-preferences/", UserNotificationPreferenceView.as_view(), name="user-notification-preferences"),
 

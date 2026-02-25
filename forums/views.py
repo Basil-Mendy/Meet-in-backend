@@ -4,9 +4,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
+from django.db.models import Q, Count
 from django.utils import timezone
 from datetime import timedelta
+from django.http import FileResponse, Http404
+import mimetypes
 
 from .models import (
     Forum, ForumMembership, ProfileRing, ForumJoinRequest, ForumInvitationCode,
@@ -14,9 +16,9 @@ from .models import (
     Meeting, MeetingParticipant, MeetingMinute,
     ForumMeeting, MeetingAttendee,
     ForumPayment, ForumPaymentSubmission,
-    Announcement, AnnouncementRead,
+    Announcement, AnnouncementRead, AnnouncementRecipient, AnnouncementAttachment,
     Poll, PollGroup, PollOption, PollVote,
-    Notification, UserNotificationPreference
+    Notification, UserNotificationPreference, ForumActivityHistory
 )
 from .serializers import (
     ForumSerializer, ForumCreateSerializer, ForumCompleteSerializer,
@@ -28,9 +30,12 @@ from .serializers import (
     ForumPaymentSerializer, ForumPaymentSubmissionSerializer,
     AnnouncementSerializer,
     PollGroupSerializer, PollSerializer, PollOptionSerializer,
-    NotificationSerializer, NotificationListSerializer, UserNotificationPreferenceSerializer
+    NotificationSerializer, NotificationListSerializer, UserNotificationPreferenceSerializer,
+    ForumActivityHistorySerializer
 )
 from accounts.permissions import IsProfileCompleted
+from .notification_service import NotificationService
+from accounts.models import User
 
 
 # Create Forum (PROFILE MUST BE COMPLETED)
@@ -645,10 +650,24 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         forum_id = self.kwargs.get("forum_id")
         show_archived = self.request.query_params.get('archived', 'false').lower() == 'true'
-        return Announcement.objects.filter(
-            forum_id=forum_id,
-            is_archived=show_archived
-        ).order_by('-created_at')
+        # Only return announcements that the requesting user is allowed to see.
+        # GENERAL announcements are visible to all forum members.
+        # TARGETED announcements are visible only to their recipients and admins.
+        base_qs = Announcement.objects.filter(forum_id=forum_id, is_archived=show_archived)
+        user = self.request.user
+
+        # If user is admin of the forum, return all announcements
+        try:
+            membership = ForumMembership.objects.filter(user=user, forum_id=forum_id, is_active=True).first()
+            if membership and membership.role in ["SA", "CP", "VC", "SEC", "FSEC"]:
+                return base_qs.order_by('-created_at')
+        except Exception:
+            pass
+
+        # Non-admin: GENERAL announcements plus TARGETED announcements where user is a recipient
+        return base_qs.filter(
+            Q(announcement_type='GENERAL') | Q(announcement_type='TARGETED', recipients__user=user)
+        ).distinct().order_by('-created_at')
 
     def list(self, request, *args, **kwargs):
         forum_id = self.kwargs.get("forum_id")
@@ -693,50 +712,70 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
 
         announcement = serializer.save(created_by=request.user, forum=forum)
 
-        # Handle email announcements
-        if announcement.announcement_type == 'EMAIL':
+        # If TARGETED announcement, process recipients and attachments and deliver in-app notifications
+        if announcement.announcement_type == 'TARGETED':
             recipient_ids = request.data.get('recipient_ids', [])
-            
-            if not recipient_ids:
-                # Default to all members
-                members = ForumMembership.objects.filter(
-                    forum=forum, is_active=True
-                ).values_list('user_id', flat=True)
-                recipient_ids = list(members)
+            all_members = request.data.get('all_members', False)
 
-            # Fetch recipients
+            if all_members:
+                recipient_ids = list(ForumMembership.objects.filter(forum=forum, is_active=True).values_list('user_id', flat=True))
+
+            # Create recipient records
             recipients = User.objects.filter(id__in=recipient_ids)
-            
-            # Send emails using forum email as sender
-            email_subject = f"[{forum.name}] {announcement.title}"
-            email_body = f"{announcement.message}\n\n---\nForum: {forum.name}\nPosted by: {request.user.get_full_name()}"
-            
-            # Use forum email if available, otherwise fall back to DEFAULT_FROM_EMAIL
-            from_email = forum.email if forum.email else settings.DEFAULT_FROM_EMAIL
-
-            for user in recipients:
-                # Create recipient record
-                recipient_record = AnnouncementRecipient.objects.create(
-                    announcement=announcement,
-                    user=user,
-                    email_delivery_status='PENDING'
-                )
-
-                # Send email from forum's email address
+            created_recips = []
+            for u in recipients:
                 try:
-                    send_mail(
-                        email_subject,
-                        email_body,
-                        from_email,
-                        [user.email],
-                        fail_silently=False,
+                    rec_obj, created = AnnouncementRecipient.objects.get_or_create(announcement=announcement, user=u)
+                    if created:
+                        created_recips.append(rec_obj)
+                except Exception:
+                    continue
+
+            # Create in-app notifications for recipients
+            notif_service = NotificationService()
+            for rec in created_recips:
+                try:
+                    Notification.objects.create(
+                        user=rec.user,
+                        forum=forum,
+                        notification_type='ANNOUNCEMENT_CREATED',
+                        title=announcement.title,
+                        message=(announcement.message[:200] + '...') if len(announcement.message) > 200 else announcement.message,
+                        tab='announcements',
+                        object_id=str(announcement.id)
                     )
-                    recipient_record.email_delivery_status = 'SENT'
-                except Exception as e:
-                    recipient_record.email_delivery_status = 'FAILED'
-                    recipient_record.email_error = str(e)
-                
-                recipient_record.save()
+
+                    # Trigger push (best-effort) using notification service if available
+                    try:
+                        NotificationService.create_notification(
+                            forum=forum,
+                            user=rec.user,
+                            notification_type='ANNOUNCEMENT_CREATED',
+                            title=announcement.title,
+                            message=(announcement.message[:200] + '...') if len(announcement.message) > 200 else announcement.message,
+                            tab='announcements',
+                            object_id=str(announcement.id),
+                            send_push=True,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+
+        # Handle attachments (multipart file uploads)
+        try:
+            files = request.FILES.getlist('attachments')
+            for f in files:
+                AnnouncementAttachment.objects.create(
+                    announcement=announcement,
+                    file=f,
+                    filename=f.name,
+                    size=f.size,
+                    uploaded_by=request.user
+                )
+        except Exception:
+            # ignore attachment save errors but log in real deployments
+            pass
 
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
@@ -827,6 +866,64 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         ]
 
         return Response({'members': members_data})
+
+
+class AnnouncementAttachmentDownloadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, forum_id=None, attachment_id=None):
+        # Serve attachment only if requester is allowed to view the parent announcement
+        attachment = get_object_or_404(AnnouncementAttachment, id=attachment_id)
+        announcement = attachment.announcement
+
+        # Ensure attachment belongs to the requested forum
+        if str(announcement.forum.id) != str(forum_id):
+            raise Http404('Attachment not found')
+
+        # Verify membership
+        membership = ForumMembership.objects.filter(user=request.user, forum=announcement.forum, is_active=True).first()
+        if not membership:
+            return Response({'error': 'You are not a member of this forum'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Admins can access all attachments
+        admin_roles = ["SA", "CP", "VC", "SEC", "FSEC"]
+        if membership.role in admin_roles:
+            allowed = True
+        else:
+            # GENERAL announcements visible to all members
+            if announcement.announcement_type == 'GENERAL':
+                allowed = True
+            else:
+                # TARGETED -> only recipients can access
+                allowed = AnnouncementRecipient.objects.filter(announcement=announcement, user=request.user).exists()
+
+        if not allowed:
+            return Response({'error': 'You are not authorized to access this attachment'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Stream file. Use ?download=true to force attachment download; otherwise prefer inline display when possible.
+        try:
+            file_handle = attachment.file.open('rb')
+            # determine content type
+            content_type = None
+            try:
+                # try to get from stored file (if available)
+                if hasattr(attachment.file, 'file') and hasattr(attachment.file.file, 'content_type'):
+                    content_type = attachment.file.file.content_type
+            except Exception:
+                content_type = None
+
+            if not content_type:
+                content_type, _ = mimetypes.guess_type(attachment.filename)
+
+            download = str(request.query_params.get('download', 'false')).lower() == 'true'
+
+            # Return FileResponse with content_type and attachment disposition based on download flag
+            response = FileResponse(file_handle, as_attachment=download, filename=attachment.filename)
+            if content_type:
+                response['Content-Type'] = content_type
+            return response
+        except Exception as e:
+            return Response({'error': 'Failed to open attachment'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=["post"])
     def mark_all_as_read(self, request, forum_id=None):
@@ -1117,6 +1214,21 @@ End time: {poll.end_time}
             except Exception as e:
                 # Log but don't fail the poll creation
                 print(f"Failed to send poll notification to {membership.user.email}: {str(e)}")
+        # Create in-app notifications for forum members (exclude creator)
+        try:
+            NotificationService.create_forum_notifications(
+                forum=forum,
+                notification_type='POLL_CREATED',
+                title=f"New poll in {forum.name}",
+                message=f"{creator.get_full_name() or creator.email} created poll \"{poll.title}\"",
+                tab='polls',
+                object_id=str(poll.id),
+                excluded_users=[creator],
+                send_push=True,
+                send_email=False,
+            )
+        except Exception as e:
+            print(f"Failed to create in-app poll notifications: {e}")
 
     @action(detail=True, methods=["post"])
     def vote(self, request, forum_id=None, pk=None):
@@ -1526,11 +1638,18 @@ class NotificationViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
     def list(self, request):
-        """Get all unread notifications for user (across all forums)"""
-        notifications = Notification.objects.filter(
-            user=request.user,
-            is_read=False
-        ).order_by("-created_at")
+        """Get all notifications for user (across all forums), ordered by newest first"""
+        # Show all notifications by default, can filter with ?status=unread
+        status = request.query_params.get('status', 'all')
+        
+        query = Notification.objects.filter(user=request.user)
+        
+        if status == 'unread':
+            query = query.filter(is_read=False)
+        elif status == 'read':
+            query = query.filter(is_read=True)
+        
+        notifications = query.order_by("-created_at")
         
         serializer = NotificationListSerializer(notifications, many=True)
         return Response(serializer.data)
@@ -1557,20 +1676,41 @@ class NotificationViewSet(viewsets.ViewSet):
         ).distinct()
 
         forum_counts = {}
+        tab_counts = {}
         global_count = 0
+        timestamp = timezone.now().isoformat()
 
         for forum in forums:
-            count = Notification.objects.filter(
+            forum_id_str = str(forum.id)
+            
+            # Get total count per forum
+            forum_notifs = Notification.objects.filter(
                 user=request.user,
                 forum=forum,
                 is_read=False
-            ).count()
-            forum_counts[str(forum.id)] = count
+            )
+            count = forum_notifs.count()
+            forum_counts[forum_id_str] = count
             global_count += count
+            
+            # Get per-tab counts for this forum
+            tab_counts[forum_id_str] = {}
+            tab_breakdown = forum_notifs.values('tab').annotate(count=Count('id')).order_by('tab')
+            
+            for notif in tab_breakdown:
+                if notif['tab']:
+                    tab_counts[forum_id_str][notif['tab']] = notif['count']
+            
+            # Debug logging
+            print(f"[{timestamp}] Counting for forum {forum.name} ({forum_id_str})")
+            print(f"  Total unread: {count}")
+            print(f"  By tab: {dict(tab_counts[forum_id_str])}")
 
+        print(f"[{timestamp}] Final counts - Global: {global_count}, Forums: {len(forum_counts)}")
         return Response({
             "global_count": global_count,
-            "forum_counts": forum_counts
+            "forum_counts": forum_counts,
+            "tab_counts": tab_counts
         })
 
     @action(detail=False, methods=["get"], url_path="tab")
@@ -1628,15 +1768,62 @@ class NotificationViewSet(viewsets.ViewSet):
         forum_id = request.data.get("forum_id")
         tab = request.data.get("tab")
         
+        print(f"[API-CLEAR-TAB] Clearing tab={tab} for forum={forum_id}, user={request.user.id}")
+        
         if forum_id and tab:
-            Notification.objects.filter(
+            # Get count before clearing (for logging)
+            before_count = Notification.objects.filter(
+                user=request.user,
+                forum_id=forum_id,
+                tab=tab,
+                is_read=False
+            ).count()
+            
+            # Clear notifications
+            updated = Notification.objects.filter(
                 user=request.user,
                 forum_id=forum_id,
                 tab=tab,
                 is_read=False
             ).update(is_read=True)
+            
+            print(f"[API-CLEAR-TAB] Marked {updated} notifications as read (was {before_count} unread)")
+            
+            return Response({
+                "status": f"{tab} notifications cleared",
+                "cleared_count": updated
+            })
+        
+        return Response({"status": "no forum_id or tab provided"})
 
-        return Response({"status": f"{tab} notifications cleared"})
+    @action(detail=True, methods=["post"], url_path="mark-read")
+    def mark_single_as_read(self, request, pk=None):
+        """Mark a single notification as read"""
+        try:
+            notification = Notification.objects.get(id=pk, user=request.user)
+            notification.is_read = True
+            notification.read_at = timezone.now()
+            notification.save()
+            serializer = NotificationListSerializer(notification)
+            return Response(serializer.data)
+        except Notification.DoesNotExist:
+            return Response(
+                {"error": "Notification not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    @action(detail=True, methods=["delete"])
+    def destroy(self, request, pk=None):
+        """Delete a single notification"""
+        try:
+            notification = Notification.objects.get(id=pk, user=request.user)
+            notification.delete()
+            return Response({"status": "notification deleted"})
+        except Notification.DoesNotExist:
+            return Response(
+                {"error": "Notification not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
 
 class UserNotificationPreferenceView(APIView):
@@ -1666,3 +1853,105 @@ class UserNotificationPreferenceView(APIView):
 
 
 # ==================== ANNOUNCEMENTS (HANDLED BY VIEWSET ABOVE) ====================
+
+# ==================== FORUM ACTIVITY HISTORY / GENERAL RECORDS ====================
+class ForumActivityHistoryView(APIView):
+    """API endpoint to fetch forum activity history for general records"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, forum_id):
+        """Fetch activity history filtered by date range and tabs"""
+        try:
+            forum = Forum.objects.get(id=forum_id)
+        except Forum.DoesNotExist:
+            return Response({"error": "Forum not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if user is admin of this forum
+        membership = ForumMembership.objects.filter(
+            forum=forum,
+            user=request.user
+        ).first()
+        
+        # Admin roles list
+        ADMIN_ROLES = ["MOD", "C", "VC", "SEC", "ASEC", "FSEC", "TR", "PRO", "POI", "POII", "SA", "CP"]
+        
+        if not membership:
+            return Response(
+                {"error": "You are not a member of this forum"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if membership.role not in ADMIN_ROLES:
+            return Response(
+                {"error": "Only forum admins can access general records"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Get query parameters
+        date_from = request.query_params.get("date_from")  # YYYY-MM-DD
+        date_to = request.query_params.get("date_to")      # YYYY-MM-DD
+        tabs = request.query_params.getlist("tabs")        # e.g. ['feed', 'meetings']
+        activity_type = request.query_params.get("activity_type")  # Optional filter by activity type
+        search = request.query_params.get("search")        # Optional search in title/description
+        
+        # Build queryset
+        queryset = ForumActivityHistory.objects.filter(forum=forum)
+        
+        # Filter by date range
+        if date_from:
+            from datetime import datetime
+            try:
+                date_from_obj = datetime.strptime(date_from, "%Y-%m-%d")
+                queryset = queryset.filter(created_at__gte=date_from_obj)
+            except ValueError:
+                return Response(
+                    {"error": "Invalid date_from format. Use YYYY-MM-DD"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        if date_to:
+            from datetime import datetime, timedelta
+            try:
+                date_to_obj = datetime.strptime(date_to, "%Y-%m-%d")
+                # Include the entire day
+                date_to_obj = date_to_obj + timedelta(days=1)
+                queryset = queryset.filter(created_at__lt=date_to_obj)
+            except ValueError:
+                return Response(
+                    {"error": "Invalid date_to format. Use YYYY-MM-DD"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Filter by tabs (if specified)
+        if tabs:
+            queryset = queryset.filter(tab__in=tabs)
+        
+        # Filter by activity type (if specified)
+        if activity_type:
+            queryset = queryset.filter(activity_type=activity_type)
+        
+        # Search in title and description
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(title__icontains=search) | Q(description__icontains=search)
+            )
+        
+        # Order by date (newest first by default, can be changed)
+        order_by = request.query_params.get("order_by", "-created_at")
+        if order_by in ["created_at", "-created_at"]:
+            queryset = queryset.order_by(order_by)
+        else:
+            queryset = queryset.order_by("-created_at")
+        
+        # Serialize and return
+        serializer = ForumActivityHistorySerializer(queryset, many=True)
+        
+        return Response({
+            "count": queryset.count(),
+            "results": serializer.data,
+            "forum": {
+                "id": forum.id,
+                "name": forum.name
+            }
+        })

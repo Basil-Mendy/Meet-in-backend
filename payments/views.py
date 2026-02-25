@@ -224,59 +224,81 @@ class PayMemberPaymentView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, member_payment_id):
-        mp = get_object_or_404(MemberPayment, id=member_payment_id)
-        if mp.user != request.user:
-            return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
-        if mp.status == 'PAID':
-            return Response({"detail": "Already paid"})
-
-        # ensure wallets exist
-        user_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
-        forum_wallet, _ = ForumWallet.objects.get_or_create(forum=mp.payment.forum)
-
-        # For CONTRIBUTION: accept optional amount from request; validate min/max
-        # For DUES/LEVY: use amount_due from MemberPayment
-        amount_to_pay = mp.amount_due
-        
-        if mp.payment.type == "CONTRIBUTION":
-            request_amount = request.data.get("amount")
-            if request_amount:
-                amount_to_pay = Decimal(str(request_amount))
-                # Validate min/max
-                if amount_to_pay < Decimal(mp.payment.min_amount or 0):
-                    return Response(
-                        {"error": f"Amount must be at least {mp.payment.min_amount}"}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                if mp.payment.max_amount and amount_to_pay > Decimal(mp.payment.max_amount):
-                    return Response(
-                        {"error": f"Amount cannot exceed {mp.payment.max_amount}"}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
         try:
-            tx = WalletService.transfer_user_to_forum(
-                user_wallet, forum_wallet, Decimal(amount_to_pay), 
-                reason=f"Payment:{mp.payment.id}", reference=str(uuid.uuid4())
-            )
+            mp = get_object_or_404(MemberPayment, id=member_payment_id)
+            if mp.user != request.user:
+                return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
+            if mp.status == 'PAID':
+                return Response({"detail": "Already paid"})
+
+            # ensure wallets exist
+            user_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
+            forum_wallet, _ = ForumWallet.objects.get_or_create(forum=mp.payment.forum)
+
+            # For CONTRIBUTION: accept optional amount from request; validate min/max
+            # For DUES/LEVY: use amount_due from MemberPayment
+            amount_to_pay = mp.amount_due
+
+            if mp.payment.type == "CONTRIBUTION":
+                request_amount = request.data.get("amount")
+                if request_amount:
+                    amount_to_pay = Decimal(str(request_amount))
+                    # Validate min/max
+                    if amount_to_pay < Decimal(mp.payment.min_amount or 0):
+                        return Response(
+                            {"error": f"Amount must be at least {mp.payment.min_amount}"}, 
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    if mp.payment.max_amount and amount_to_pay > Decimal(mp.payment.max_amount):
+                        return Response(
+                            {"error": f"Amount cannot exceed {mp.payment.max_amount}"}, 
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+            try:
+                tx = WalletService.transfer_user_to_forum(
+                    user_wallet, forum_wallet, Decimal(amount_to_pay), 
+                    reason=f"Payment:{mp.payment.id}", reference=str(uuid.uuid4())
+                )
+            except Exception as e:
+                # Return a clear 400 with error message for known issues (insufficient funds, validation)
+                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+            # mark payment as paid
+            mp.amount_paid = mp.amount_paid + Decimal(amount_to_pay)
+            mp.status = 'PAID'
+            mp.paid_at = timezone.now()
+            mp.save()
+
+            # Return success immediately (payment is already saved to DB)
+            # Activity update is best-effort and won't block the response
+            response_data = {
+                "message": "Payment completed successfully",
+                "transaction_id": str(tx.id),
+                "status": "success"
+            }
+
+            # Attempt activity update (best-effort, non-blocking)
+            try:
+                membership = ForumMembership.objects.filter(forum=mp.payment.forum, user=request.user).first()
+                if membership:
+                    # Check if activity relation exists
+                    if hasattr(membership, 'activity') and membership.activity:
+                        activity = membership.activity
+                        activity.payments_completed = (activity.payments_completed or 0) + 1
+                        activity.activity_score = (activity.activity_score or 0) + 10
+                        activity.save()
+            except Exception as activity_error:
+                # Log but don't fail the response - payment already succeeded
+                import sys
+                sys.stderr.write(f"[ACTIVITY-UPDATE] Warning: failed to update activity: {activity_error}\n")
+
+            return Response(response_data, status=status.HTTP_200_OK)
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-        # mark payment as paid
-        mp.amount_paid = mp.amount_paid + Decimal(amount_to_pay)
-        mp.status = 'PAID'
-        mp.paid_at = timezone.now()
-        mp.save()
-
-        # update member activity
-        membership = ForumMembership.objects.filter(forum=mp.payment.forum, user=request.user).first()
-        if membership and hasattr(membership, 'activity'):
-            activity = membership.activity
-            activity.payments_completed += 1
-            activity.activity_score += 10
-            activity.save()
-
-        return Response({"message": "Payment completed", "transaction_id": str(tx.id)})
+            import traceback, sys
+            tb = traceback.format_exc()
+            sys.stderr.write(f"[PAYMENT-ERROR] {e}\n{tb}\n")
+            return Response({"error": "Internal server error", "detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class ForumWalletBalanceView(views.APIView):

@@ -55,14 +55,16 @@ class Forum(models.Model):
 
 class ForumMembership(models.Model):
     ROLE_CHOICES = [
-        ("SA", "Sole Admin"),
-        ("CP", "Chairperson"),
-        ("VC", "Vice Chairperson"),
+        ("MOD", "Moderator (Creator)"),
+        ("C", "Chairman"),
+        ("VC", "Vice Chairman"),
         ("SEC", "Secretary"),
+        ("ASEC", "Assistant Secretary"),
         ("FSEC", "Financial Secretary"),
-        ("PRO1", "Provost 1"),
-        ("PRO2", "Provost 2"),
-        ("PRO3", "Provost 3"),
+        ("TR", "Treasurer"),
+        ("PRO", "Public Relation Officer"),
+        ("POI", "Provost I"),
+        ("POII", "Provost II"),
         ("MEMBER", "Member"),
     ]
 
@@ -78,6 +80,11 @@ class ForumMembership(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.forum}"
+    
+    @property
+    def is_admin(self):
+        """Check if user has admin role (any role except MEMBER)"""
+        return self.role != "MEMBER"
 
 
 class ForumEmailSettings(models.Model):
@@ -115,23 +122,44 @@ class MemberActivity(models.Model):
         on_delete=models.CASCADE,
         related_name="activity"
     )
+
+    # Core counters
+    activity_score = models.FloatField(default=0.0)
+    posts_count = models.IntegerField(default=0)
+    comments_count = models.IntegerField(default=0)
+    reactions_count = models.IntegerField(default=0)
     meetings_attended = models.IntegerField(default=0)
-    payments_completed = models.IntegerField(default=0)
-    chats_sent = models.IntegerField(default=0)
-    last_active = models.DateTimeField(auto_now=True)
-    activity_score = models.IntegerField(default=0)
+    payments_paid = models.IntegerField(default=0)
+    polls_participated = models.IntegerField(default=0)
+    forum_open_days = models.IntegerField(default=0)
+
+    # Timestamps
+    last_activity_at = models.DateTimeField(null=True, blank=True)
+    last_open_date = models.DateField(null=True, blank=True)
+    last_calculated_at = models.DateTimeField(null=True, blank=True)
+
+    # Ring info
+    ring_level = models.CharField(max_length=32, default="Dormant")
+    ring_color = models.CharField(max_length=16, default="#9CA3AF")
 
     def save(self, *args, **kwargs):
+        # Ensure last_activity_at is set when score changes
+        if not self.last_activity_at and self.activity_score > 0:
+            from django.utils import timezone
+            self.last_activity_at = timezone.now()
+
         super().save(*args, **kwargs)
 
-        # Only update ring if it exists (not during initial creation)
-        if hasattr(self.membership, 'ring'):
-            ring = self.membership.ring
-            new_color = calculate_ring(self.activity_score)
-
-            if ring.ring_color != new_color:
-                ring.ring_color = new_color
-                ring.save()
+        # Update associated ProfileRing if exists
+        try:
+            if hasattr(self.membership, 'ring'):
+                ring = self.membership.ring
+                # store ring_color code and keep ring model choice in sync
+                if ring.ring_color != self.ring_level:
+                    ring.ring_color = self.ring_level
+                    ring.save()
+        except Exception:
+            pass
 
 
 
@@ -758,24 +786,23 @@ class BankAccount(models.Model):
 
 class Announcement(models.Model):
     ANNOUNCEMENT_TYPE_CHOICES = [
-        ("FORUM", "Forum Announcement"),
-        ("EMAIL", "Email Announcement"),
+        ("GENERAL", "General Announcement"),
+        ("TARGETED", "Targeted Announcement"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="announcements")
     title = models.CharField(max_length=255)
     message = models.TextField()
-    announcement_type = models.CharField(max_length=20, choices=ANNOUNCEMENT_TYPE_CHOICES, default="FORUM")
-    
+    announcement_type = models.CharField(max_length=20, choices=ANNOUNCEMENT_TYPE_CHOICES, default="GENERAL")
+
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="created_announcements")
     created_at = models.DateTimeField(auto_now_add=True)
     
     is_archived = models.BooleanField(default=False)
     archived_at = models.DateTimeField(null=True, blank=True)
     
-    # For email announcements: whether to save to forum feed
-    save_to_forum_feed = models.BooleanField(default=True)
+    # Attachments and targeted recipients handled by related models
 
     class Meta:
         ordering = ["-created_at"]
@@ -789,18 +816,16 @@ class Announcement(models.Model):
 
 
 class AnnouncementRecipient(models.Model):
-    """Tracks email announcement recipients for audit"""
+    """Tracks targeted announcement recipients (who are allowed to view the announcement)
+
+    This replaces email-specific recipient tracking. Each record represents a user who
+    should be able to view a targeted announcement and receive in-app/push notifications.
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="email_recipients")
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="announcement_emails_received")
-    
-    email_sent_at = models.DateTimeField(auto_now_add=True)
-    email_delivery_status = models.CharField(
-        max_length=20,
-        choices=[("PENDING", "Pending"), ("SENT", "Sent"), ("FAILED", "Failed")],
-        default="PENDING"
-    )
-    email_error = models.TextField(blank=True)
+    announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="recipients")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="announcement_recipients")
+
+    added_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ("announcement", "user")
@@ -811,6 +836,23 @@ class AnnouncementRecipient(models.Model):
 
     def __str__(self):
         return f"{self.announcement.title} → {self.user.email}"
+
+
+class AnnouncementAttachment(models.Model):
+    """Attachment for announcements. Files must be served via authenticated endpoints."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="attachments")
+    file = models.FileField(upload_to="announcement_attachments/")
+    filename = models.CharField(max_length=255)
+    size = models.BigIntegerField()
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="uploaded_announcement_attachments")
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+
+    def __str__(self):
+        return f"{self.filename} ({self.size} bytes)"
 
 
 class AnnouncementRead(models.Model):
@@ -941,3 +983,83 @@ class UserNotificationPreference(models.Model):
 
     def __str__(self):
         return f"Notification preferences for {self.user.email}"
+
+
+# ==================== FORUM ACTIVITY HISTORY ====================
+class ForumActivityHistory(models.Model):
+    """Track all activities/actions per tab for admin general records"""
+    ACTIVITY_TYPE_CHOICES = [
+        ("post_created", "Post Created"),
+        ("post_deleted", "Post Deleted"),
+        ("post_edited", "Post Edited"),
+        ("comment_created", "Comment Created"),
+        ("comment_deleted", "Comment Deleted"),
+        ("reaction_added", "Reaction Added"),
+        ("meeting_created", "Meeting Created"),
+        ("meeting_updated", "Meeting Updated"),
+        ("meeting_deleted", "Meeting Deleted"),
+        ("meeting_attended", "Meeting Attended"),
+        ("payment_created", "Payment Created"),
+        ("payment_submitted", "Payment Submitted"),
+        ("disbursement_created", "Disbursement Created"),
+        ("disbursement_processed", "Disbursement Processed"),
+        ("member_joined", "Member Joined"),
+        ("member_left", "Member Left"),
+        ("member_role_changed", "Member Role Changed"),
+        ("announcement_created", "Announcement Created"),
+        ("announcement_deleted", "Announcement Deleted"),
+        ("poll_created", "Poll Created"),
+        ("poll_voted", "Poll Voted"),
+        ("document_uploaded", "Document Uploaded"),
+        ("document_deleted", "Document Deleted"),
+        ("settings_changed", "Settings Changed"),
+        ("other", "Other"),
+    ]
+    
+    TAB_CHOICES = [
+        ("feed", "Feed"),
+        ("meetings", "Meetings"),
+        ("payments", "Payments"),
+        ("disbursements", "Disbursements"),
+        ("members", "Members"),
+        ("about", "About"),
+        ("announcements", "Announcements"),
+        ("polls", "Polls"),
+        ("settings", "Settings"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="activity_history")
+    
+    # Who performed the action
+    performed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="forum_activities")
+    
+    # What happened
+    activity_type = models.CharField(max_length=50, choices=ACTIVITY_TYPE_CHOICES)
+    tab = models.CharField(max_length=50, choices=TAB_CHOICES)
+    
+    # Details
+    title = models.CharField(max_length=255, help_text="Activity title/summary")
+    description = models.TextField(blank=True, help_text="Detailed description of the activity")
+    
+    # Related object
+    object_id = models.CharField(max_length=50, blank=True, help_text="ID of related object (post, meeting, payment, etc)")
+    object_type = models.CharField(max_length=50, blank=True, help_text="Type of related object")
+    
+    # Additional metadata
+    metadata = models.JSONField(default=dict, blank=True, help_text="Any additional JSON data")
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["forum", "-created_at"]),
+            models.Index(fields=["forum", "tab", "-created_at"]),
+            models.Index(fields=["forum", "activity_type", "-created_at"]),
+            models.Index(fields=["performed_by", "-created_at"]),
+        ]
+    
+    def __str__(self):
+        return f"{self.get_activity_type_display()} in {self.forum.name} ({self.tab})"

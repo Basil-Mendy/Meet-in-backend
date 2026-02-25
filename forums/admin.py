@@ -14,7 +14,7 @@ class ForumMembershipAdmin(admin.ModelAdmin):
 
 @admin.register(MemberActivity)
 class MemberActivityAdmin(admin.ModelAdmin):
-    list_display = ("membership", "meetings_attended", "payments_completed", "activity_score")
+    list_display = ("membership", "meetings_attended", "payments_paid", "activity_score")
 
 
 @admin.register(ProfileRing)

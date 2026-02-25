@@ -11,6 +11,7 @@ from .about_serializers import (
     ForumAboutSerializer, ForumDocumentSerializer,
     ForumSettingsSerializer, BankAccountSerializer
 )
+from .notification_service import NotificationService
 
 
 class IsForumAdmin(permissions.BasePermission):
@@ -63,12 +64,35 @@ class ForumInfoEditView(views.APIView):
             'email', 'phone', 'profile_picture', 'objectives_rules'
         ]
         
+        # Track which fields were updated
+        updated_fields = []
         # Only allow editing specified fields
         for field in editable_fields:
             if field in request.data:
+                current_value = getattr(forum, field, None)
+                new_value = request.data[field]
+                if current_value != new_value:
+                    updated_fields.append(field)
                 setattr(forum, field, request.data[field])
         
         forum.save()
+        
+        # Notify members if any fields were updated
+        if updated_fields:
+            try:
+                NotificationService.create_forum_notifications(
+                    forum=forum,
+                    notification_type='FORUM_INFO_UPDATED',
+                    title=f"Forum information updated in {forum.name}",
+                    message=f"The following information was updated: {', '.join(updated_fields)}",
+                    tab='about',
+                    object_id=str(forum.id),
+                    send_push=True,
+                    send_email=False,
+                )
+            except Exception as e:
+                print(f"[Notification] Failed to create forum info update notification: {e}")
+        
         serializer = ForumAboutSerializer(forum)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -196,6 +220,26 @@ class BankAccountView(views.APIView):
                 'bank_code': request.data.get('bank_code', ''),
             }
         )
+        
+        # Notify members about bank account update
+        try:
+            if created:
+                message = f"Bank account configured for {forum.name}"
+            else:
+                message = f"Bank account information updated for {forum.name}"
+            
+            NotificationService.create_forum_notifications(
+                forum=forum,
+                notification_type='FORUM_INFO_UPDATED',
+                title="Bank account update",
+                message=message,
+                tab='about',
+                object_id=str(forum.id),
+                send_push=True,
+                send_email=False,
+            )
+        except Exception as e:
+            print(f"[Notification] Failed to create bank account notification: {e}")
         
         serializer = BankAccountSerializer(bank_account)
         return Response(serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
