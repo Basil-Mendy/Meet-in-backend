@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import generics, permissions, status, views
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError
 from django.db.models import Q
 
 from .models import (
@@ -18,11 +19,12 @@ from .models import (
 from .serializers import (
     ForumPaymentSerializer,
     MemberPaymentSerializer,
+    WalletTransactionSerializer,
+    UserToUserTransferSerializer,
+    UserToForumTransferSerializer,
+    ForumToForumTransferSerializer,
 )
 from forums.models import ForumMembership
-
-
-ADMIN_ROLES = ["SA", "CP", "VC", "SEC", "FSEC"]
 
 
 class CreateForumPaymentView(generics.CreateAPIView):
@@ -36,7 +38,7 @@ class CreateForumPaymentView(generics.CreateAPIView):
             user=self.request.user
         ).first()
 
-        if not forum_membership or forum_membership.role not in ADMIN_ROLES:
+        if not forum_membership or not forum_membership.is_core_executive:
             raise PermissionError("Not authorized to create payments")
 
         payment = serializer.save(created_by=self.request.user, forum_id=forum_id)
@@ -63,48 +65,84 @@ class MemberDisbursementsView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, forum_id):
-        from .models import Disbursement, DisbursementCategory, WalletTransaction
+        from .models import Disbursement, DisbursementCategory, WalletTransaction, DisbursementTransaction
         
-        disbursements = []
-        
+        results = []
         try:
-            # Fetch via DisbursementCategory M2M (for PAY_ALL type)
-            categories = DisbursementCategory.objects.filter(
-                disbursement__forum_id=forum_id,
-                members=request.user
-            ).select_related("disbursement")
-            
-            processed_disbursements = set()
-            for category in categories:
-                if category.disbursement.id not in processed_disbursements:
-                    processed_disbursements.add(category.disbursement.id)
-                    # Find actual transaction to get received amount
-                    tx = WalletTransaction.objects.filter(
+            # First: find any executed disbursement transactions for this user within the forum
+            txs = DisbursementTransaction.objects.filter(
+                user=request.user,
+                disbursement__forum_id=forum_id
+            ).select_related('disbursement', 'disbursement__forum', 'wallet_transaction')
+
+            for dt in txs:
+                disb = dt.disbursement
+                wallet_tx = getattr(dt, 'wallet_transaction', None)
+                sender_name = None
+                # For disbursements the source is typically the forum wallet
+                try:
+                    sender_name = disb.forum.name if disb.forum else None
+                except Exception:
+                    sender_name = None
+
+                results.append({
+                    "id": str(disb.id),
+                    "title": disb.title,
+                    "forum_id": str(disb.forum_id) if disb.forum_id else None,
+                    "amount_received": str(dt.amount),
+                    "received_date": (wallet_tx.created_at.isoformat() if wallet_tx and getattr(wallet_tx, 'created_at', None) else dt.created_at.isoformat()),
+                    "status": disb.status,
+                    "type": disb.type,
+                    "sender": sender_name,
+                })
+
+            # If none found via DisbursementTransaction, fall back to category membership (for pending/unlinked records)
+            if not results:
+                categories = DisbursementCategory.objects.filter(
+                    disbursement__forum_id=forum_id,
+                    members=request.user
+                ).select_related("disbursement")
+
+                processed = set()
+                for category in categories:
+                    disb = category.disbursement
+                    if disb.id in processed:
+                        continue
+                    processed.add(disb.id)
+
+                    # Try to find a matching wallet transaction by reference or disbursement id
+                    wallet_tx = WalletTransaction.objects.filter(
                         dest_user_wallet__user=request.user,
-                        reason__icontains=f"Disbursement:{category.disbursement.id}"
+                        reference=str(disb.id)
                     ).first()
-                    
-                    # Handle None values for dates
-                    disbursement_date = category.disbursement.disbursement_date
+
                     received_date = None
-                    if tx:
-                        received_date = tx.created_at.isoformat()
-                    elif disbursement_date:
-                        received_date = disbursement_date.isoformat()
-                    
-                    disbursements.append({
-                        "id": str(category.disbursement.id),
-                        "title": category.disbursement.title,
-                        "forum_id": str(category.disbursement.forum_id),
-                        "amount_received": str(tx.amount) if tx else str(category.amount),
+                    if wallet_tx and getattr(wallet_tx, 'created_at', None):
+                        received_date = wallet_tx.created_at.isoformat()
+                    elif disb.disbursement_date:
+                        received_date = disb.disbursement_date.isoformat()
+
+                    sender_name = None
+                    try:
+                        sender_name = disb.forum.name if disb.forum else None
+                    except Exception:
+                        sender_name = None
+
+                    results.append({
+                        "id": str(disb.id),
+                        "title": disb.title,
+                        "forum_id": str(disb.forum_id),
+                        "amount_received": str(wallet_tx.amount) if wallet_tx else str(category.amount),
                         "received_date": received_date,
-                        "status": "Received",
-                        "type": category.disbursement.type,
+                        "status": "Received" if wallet_tx else "Pending",
+                        "type": disb.type,
+                        "sender": sender_name,
                     })
+
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        
-        return Response(disbursements)
+
+        return Response(results)
 
 
 class ForumPaymentMatrixView(views.APIView):
@@ -127,8 +165,8 @@ class ForumPaymentMatrixView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, forum_id):
-        membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user, is_active=True).first()
+        if not membership:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         from django.db.models import Q
@@ -212,7 +250,7 @@ class ForumPaymentsAdminView(views.APIView):
 
     def get(self, request, forum_id):
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         member_payments = MemberPayment.objects.filter(payment__forum_id=forum_id).select_related('user', 'payment')
@@ -301,6 +339,102 @@ class PayMemberPaymentView(views.APIView):
             return Response({"error": "Internal server error", "detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class UserToUserTransferView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = UserToUserTransferSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        dest_user_id = serializer.validated_data["dest_user_id"]
+        amount = serializer.validated_data["amount"]
+        reason = serializer.validated_data.get("reason") or f"Transfer to user {dest_user_id}"
+        reference = serializer.validated_data.get("reference") or str(uuid.uuid4())
+
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        try:
+            dest_user = User.objects.get(id=dest_user_id)
+        except User.DoesNotExist:
+            return Response({"error": "Destination user not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        source_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
+        dest_wallet, _ = PaymentUserWallet.objects.get_or_create(user=dest_user)
+
+        try:
+            tx = WalletService.transfer_user_to_user(source_wallet, dest_wallet, amount, reason, reference)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(WalletTransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+
+class UserToForumTransferView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = UserToForumTransferSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        forum_id = serializer.validated_data["forum_id"]
+        amount = serializer.validated_data["amount"]
+        reason = serializer.validated_data.get("reason") or f"Transfer to forum {forum_id}"
+        reference = serializer.validated_data.get("reference") or str(uuid.uuid4())
+
+        from forums.models import Forum
+
+        forum = get_object_or_404(Forum, id=forum_id)
+        user_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
+        forum_wallet, _ = ForumWallet.objects.get_or_create(forum=forum)
+
+        try:
+            tx = WalletService.transfer_user_to_forum(user_wallet, forum_wallet, amount, reason, reference)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(WalletTransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+
+class ForumToForumTransferView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = ForumToForumTransferSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        source_forum_id = serializer.validated_data["source_forum_id"]
+        dest_forum_id = serializer.validated_data["dest_forum_id"]
+        amount = serializer.validated_data["amount"]
+        reason = serializer.validated_data.get("reason") or f"Transfer from forum {source_forum_id} to forum {dest_forum_id}"
+        reference = serializer.validated_data.get("reference") or str(uuid.uuid4())
+
+        if source_forum_id == dest_forum_id:
+            return Response({"error": "Source and destination forums must differ"}, status=status.HTTP_400_BAD_REQUEST)
+
+        membership = ForumMembership.objects.filter(forum_id=source_forum_id, user=request.user).first()
+        if not membership or not membership.is_core_executive:
+            return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
+
+        from forums.models import Forum
+
+        source_forum = get_object_or_404(Forum, id=source_forum_id)
+        dest_forum = get_object_or_404(Forum, id=dest_forum_id)
+
+        source_wallet, _ = ForumWallet.objects.get_or_create(forum=source_forum)
+        dest_wallet, _ = ForumWallet.objects.get_or_create(forum=dest_forum)
+
+        try:
+            tx = WalletService.transfer_forum_to_forum(source_wallet, dest_wallet, amount, reason, reference)
+        except ValidationError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(WalletTransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+
 class ForumWalletBalanceView(views.APIView):
     """Get forum wallet balance"""
     permission_classes = [permissions.IsAuthenticated]
@@ -324,7 +458,7 @@ class WalletNumberIssueView(views.APIView):
     def post(self, request, forum_id):
         # Only forum admins allowed
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         from .models import ForumWallet
@@ -360,7 +494,7 @@ class UserWalletView(views.APIView):
         # Recent transactions involving this user's wallet (incoming and outgoing)
         txs = WalletTransaction.objects.filter(
             (Q(source_user_wallet=user_wallet) | Q(dest_user_wallet=user_wallet))
-        ).order_by('-created_at')[:50]
+        ).select_related('source_user_wallet__user', 'dest_user_wallet__user', 'source_forum_wallet__forum', 'dest_forum_wallet__forum').order_by('-created_at')[:50]
 
         transactions = []
         for tx in txs:
@@ -385,6 +519,20 @@ class UserWalletView(views.APIView):
             else:
                 tx_type = "Transfer"
 
+            # Determine a human-readable counterparty (forum name or user name)
+            counterparty = None
+            try:
+                if tx.source_forum_wallet_id:
+                    counterparty = tx.source_forum_wallet.forum.name
+                elif tx.dest_forum_wallet_id:
+                    counterparty = tx.dest_forum_wallet.forum.name
+                elif tx.source_user_wallet_id and tx.source_user_wallet and getattr(tx.source_user_wallet, 'user', None):
+                    counterparty = f"{tx.source_user_wallet.user.first_name} {tx.source_user_wallet.user.last_name}".strip()
+                elif tx.dest_user_wallet_id and tx.dest_user_wallet and getattr(tx.dest_user_wallet, 'user', None):
+                    counterparty = f"{tx.dest_user_wallet.user.first_name} {tx.dest_user_wallet.user.last_name}".strip()
+            except Exception:
+                counterparty = None
+
             transactions.append({
                 'id': str(tx.id),
                 'date': tx.created_at,
@@ -392,6 +540,7 @@ class UserWalletView(views.APIView):
                 'amount': str(tx.amount),
                 'description': tx.reason,
                 'status': status_text,
+                'counterparty': counterparty,
             })
 
         return Response({
@@ -517,7 +666,7 @@ class ForumDisbursementsView(generics.ListAPIView):
     def get_queryset(self):
         forum_id = self.kwargs.get("forum_id")
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=self.request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return []
         
         from .models import Disbursement
@@ -528,7 +677,7 @@ class ForumDisbursementsView(generics.ListAPIView):
         
         forum_id = self.kwargs.get("forum_id")
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         disbursements = Disbursement.objects.filter(forum_id=forum_id).order_by("-created_at")
@@ -582,7 +731,7 @@ class CreateDisbursementView(views.APIView):
         "title": "Special Bonus",
         "type": "PAY_SELECTED",
         "disbursement_date": "2026-02-10",
-        "selected_member_ids": [...]
+        "selected_member_ids": [...],
         "amount": "2000.00"
     }
     
@@ -599,10 +748,12 @@ class CreateDisbursementView(views.APIView):
     def post(self, request, forum_id):
         # Only admins
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         from .models import Disbursement, DisbursementCategory
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
         
         title = request.data.get("title", "Disbursement")
         disb_type = request.data.get("type", "PAY_ALL")
@@ -634,16 +785,70 @@ class CreateDisbursementView(views.APIView):
                 )
                 member_ids = cat_data.get("member_ids", [])
                 if member_ids:
-                    from django.contrib.auth import get_user_model
-                    User = get_user_model()
                     users = User.objects.filter(id__in=member_ids)
                     category.members.set(users)
+
+        if disb_type == "PAY_SELECTED":
+            selected_member_ids = request.data.get("selected_member_ids", [])
+            if selected_member_ids:
+                users = User.objects.filter(id__in=selected_member_ids)
+                disbursement.selected_members.set(users)
 
         return Response({
             "message": "Disbursement created",
             "id": str(disbursement.id),
             "status": disbursement.status
         }, status=status.HTTP_201_CREATED)
+
+
+class ApproveDisbursementView(views.APIView):
+    """
+    Approve a disbursement by a President or Secretary.
+    Endpoint: POST /api/payments/forums/<forum_id>/disbursements/<disbursement_id>/approve/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, forum_id, disbursement_id):
+        from .models import Disbursement
+        from forums.models import ForumMembership
+        from django.contrib.auth import get_user_model
+        from django.db import transaction
+        User = get_user_model()
+
+        membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user, is_active=True).first()
+        if not membership:
+            return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
+
+        disbursement = get_object_or_404(Disbursement, id=disbursement_id, forum_id=forum_id)
+
+        if disbursement.status != "PENDING":
+            return Response({"error": "Only pending disbursements can be approved."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if membership.role == "P":
+            if disbursement.president_approved_by:
+                return Response({"error": "President has already approved this disbursement."}, status=status.HTTP_400_BAD_REQUEST)
+            disbursement.president_approved_by = request.user
+            disbursement.president_approved_at = timezone.now()
+            approval_role = "President"
+        elif membership.role == "SEC":
+            if disbursement.secretary_approved_by:
+                return Response({"error": "Secretary has already approved this disbursement."}, status=status.HTTP_400_BAD_REQUEST)
+            disbursement.secretary_approved_by = request.user
+            disbursement.secretary_approved_at = timezone.now()
+            approval_role = "Secretary"
+        else:
+            return Response({"error": "Only the President or Secretary may approve disbursements."}, status=status.HTTP_403_FORBIDDEN)
+
+        if membership.role == "P":
+            disbursement.save(update_fields=["president_approved_by", "president_approved_at"])
+        else:
+            disbursement.save(update_fields=["secretary_approved_by", "secretary_approved_at"])
+
+        return Response({
+            "message": f"Disbursement approved by {approval_role}.",
+            "pending_approvals": disbursement.required_approvals_pending(),
+            "ready_for_execution": disbursement.can_execute(),
+        }, status=status.HTTP_200_OK)
 
 
 class ExecuteDisbursementView(views.APIView):
@@ -663,18 +868,24 @@ class ExecuteDisbursementView(views.APIView):
         
         # Only admins
         membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user).first()
-        if not membership or membership.role not in ADMIN_ROLES:
+        if not membership or not membership.is_core_executive:
             return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
         try:
             disbursement = Disbursement.objects.get(id=disbursement_id, forum_id=forum_id)
+
+            if disbursement.status != "PENDING":
+                return Response({"error": "Disbursement already executed"}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not disbursement.can_execute():
+                return Response({
+                    "error": "Disbursement requires approval by President and Secretary before execution.",
+                    "pending_approvals": disbursement.required_approvals_pending(),
+                }, status=status.HTTP_400_BAD_REQUEST)
             
             # Lock the forum wallet during the entire transaction
             with transaction.atomic():
                 forum_wallet = ForumWallet.objects.select_for_update().get(forum_id=forum_id)
-
-                if disbursement.status != "PENDING":
-                    return Response({"error": "Disbursement already executed"}, status=status.HTTP_400_BAD_REQUEST)
 
                 # Collect members and amounts to disburse
                 distributions = []  # List of (user, amount) tuples
@@ -687,11 +898,10 @@ class ExecuteDisbursementView(views.APIView):
                             distributions.append((user, category.amount))
 
                 elif disbursement.type == "PAY_SELECTED":
-                    # Get selected members (from request)
-                    selected_member_ids = request.data.get("selected_member_ids", [])
+                    # Get selected members stored with the disbursement
+                    selected_members = disbursement.selected_members.all()
                     amount = Decimal(str(disbursement.amount))
-                    for member_id in selected_member_ids:
-                        user = User.objects.get(id=member_id)
+                    for user in selected_members:
                         distributions.append((user, amount))
 
                 elif disbursement.type == "PAY_TO_ALL":
@@ -818,6 +1028,25 @@ class GetDisbursementDetailsView(views.APIView):
                 total_disbursed += tx.amount
 
             data["total_amount_disbursed"] = str(total_disbursed)
+            data["president_approval"] = {
+                "approved": bool(disbursement.president_approved_by),
+                "approved_by": {
+                    "id": str(disbursement.president_approved_by.id),
+                    "name": f"{disbursement.president_approved_by.first_name} {disbursement.president_approved_by.last_name}"
+                } if disbursement.president_approved_by else None,
+                "approved_at": disbursement.president_approved_at,
+            }
+            data["secretary_approval"] = {
+                "approved": bool(disbursement.secretary_approved_by),
+                "approved_by": {
+                    "id": str(disbursement.secretary_approved_by.id),
+                    "name": f"{disbursement.secretary_approved_by.first_name} {disbursement.secretary_approved_by.last_name}"
+                } if disbursement.secretary_approved_by else None,
+                "approved_at": disbursement.secretary_approved_at,
+            }
+            data["required_approval_roles"] = list(disbursement.required_approval_roles())
+            data["pending_approval_roles"] = disbursement.required_approvals_pending()
+            data["ready_for_execution"] = disbursement.can_execute()
 
             return Response(data, status=status.HTTP_200_OK)
 

@@ -6,6 +6,7 @@ from .views import (
     ForumPaymentMatrixView,
     PayMemberPaymentView,
     CreateDisbursementView,
+    ApproveDisbursementView,
     ExecuteDisbursementView,
     GetDisbursementDetailsView,
     ForumDisbursementsView,
@@ -16,6 +17,9 @@ from .views import (
     UserWalletWithdrawView,
     UserBankAccountView,
     MemberDisbursementsView,
+    UserToUserTransferView,
+    UserToForumTransferView,
+    ForumToForumTransferView,
 )
 
 urlpatterns = [
@@ -31,6 +35,7 @@ urlpatterns = [
     path("forums/<uuid:forum_id>/disbursements/create/", CreateDisbursementView.as_view(), name="create-disbursement"),
     path("forums/<uuid:forum_id>/disbursements/<uuid:disbursement_id>/", GetDisbursementDetailsView.as_view(), name="get-disbursement-details"),
     path("forums/<uuid:forum_id>/disbursements/<uuid:disbursement_id>/execute/", ExecuteDisbursementView.as_view(), name="execute-disbursement"),
+    path("forums/<uuid:forum_id>/disbursements/<uuid:disbursement_id>/approve/", ApproveDisbursementView.as_view(), name="approve-disbursement"),
     path("forums/<uuid:forum_id>/my-disbursements/", MemberDisbursementsView.as_view(), name="member-disbursements"),
     
     # Wallet
@@ -40,4 +45,7 @@ urlpatterns = [
     path("users/wallet/deposit/", UserWalletDepositView.as_view(), name="user-wallet-deposit"),
     path("users/wallet/withdraw/", UserWalletWithdrawView.as_view(), name="user-wallet-withdraw"),
     path("users/bank-account/", UserBankAccountView.as_view(), name="user-bank-account"),
+    path("transfers/user-to-user/", UserToUserTransferView.as_view(), name="user-to-user-transfer"),
+    path("transfers/user-to-forum/", UserToForumTransferView.as_view(), name="user-to-forum-transfer"),
+    path("transfers/forum-to-forum/", ForumToForumTransferView.as_view(), name="forum-to-forum-transfer"),
 ]

@@ -1,8 +1,11 @@
+from decimal import Decimal
 from rest_framework import generics, status, viewsets
+from rest_framework import serializers
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import action
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.shortcuts import get_object_or_404
 from django.db.models import Q, Count
 from django.utils import timezone
@@ -11,7 +14,8 @@ from django.http import FileResponse, Http404
 import mimetypes
 
 from .models import (
-    Forum, ForumMembership, ProfileRing, ForumJoinRequest, ForumInvitationCode,
+    Forum, ForumMembership, ProfileRing, ForumVerificationRequest,
+    ForumJoinRequest, ForumInvitationCode,
     ForumPost, PostReaction, PostComment, PostCommentReply,
     Meeting, MeetingParticipant, MeetingMinute,
     ForumMeeting, MeetingAttendee,
@@ -22,7 +26,8 @@ from .models import (
 )
 from .serializers import (
     ForumSerializer, ForumCreateSerializer, ForumCompleteSerializer,
-    ProfileRingSerializer, ForumJoinRequestSerializer, ForumInvitationCodeSerializer,
+    ForumVerificationRequestSerializer,
+    ProfileRingSerializer, ForumMembershipSerializer, ForumJoinRequestSerializer, ForumInvitationCodeSerializer,
     ForumPostSerializer, PostReactionSerializer, PostCommentSerializer, PostCommentReplySerializer,
     MeetingListSerializer, MeetingDetailSerializer, MeetingCreateSerializer,
     MeetingParticipantSerializer, MeetingMinuteSerializer,
@@ -38,27 +43,190 @@ from .notification_service import NotificationService
 from accounts.models import User
 
 
+class DuplicateForumError(Exception):
+    def __init__(self, detail, existing_forum=None):
+        self.detail = detail
+        self.existing_forum = existing_forum
+        super().__init__(detail)
+
+
+def _is_forum_admin(user):
+    admin_role = getattr(user, "admin_role", None)
+    return bool(
+        user.is_superuser
+        or user.is_staff
+        or (admin_role and getattr(admin_role, "can_manage_forums", False))
+    )
+
+
 # Create Forum (PROFILE MUST BE COMPLETED)
 class CreateForumView(generics.CreateAPIView):
     serializer_class = ForumCreateSerializer
     permission_classes = [IsAuthenticated, IsProfileCompleted]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            created_forum = self.perform_create(serializer)
+        except DuplicateForumError as exc:
+            return Response(
+                {
+                    "detail": exc.detail,
+                    "existing_forum": exc.existing_forum,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        headers = self.get_success_headers(serializer.data)
+        response_data = created_forum if created_forum is not None else serializer.data
+        return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
+        data = self.request.data
+        forum_type = (data.get("forum_type") or "ORGANIZATION").upper()
+
+        if forum_type == "ORGANIZATION" and not data.get("town"):
+            raise serializers.ValidationError({"town": "Organization town is required."})
+
+        # School-class forum flow
+        if forum_type == "SCHOOL_CLASS":
+            # Try to resolve existing school id
+            school = None
+            school_id = data.get("school") or data.get("school_id")
+            if school_id:
+                try:
+                    from alumni.models import School
+                    school = School.objects.get(id=school_id)
+                except Exception:
+                    school = None
+
+            # Optionally create school inline when `create_school` is truthy
+            if not school and data.get("create_school"):
+                from alumni.models import School
+                school_name = data.get("school_name") or data.get("name")
+                if not school_name:
+                    raise serializers.ValidationError({"school": "School name is required when creating a school."})
+                school = School.objects.create(
+                    name=school_name,
+                    address=data.get("school_address") or data.get("address") or "",
+                    country=data.get("school_country") or data.get("country") or "Nigeria",
+                    state=data.get("school_state") or data.get("state") or "",
+                    lga=data.get("school_lga") or data.get("lga") or "",
+                    year_established=(data.get("school_year_established") or data.get("year_established") or 2000),
+                    school_type=data.get("school_type") or "SECONDARY",
+                    created_by=self.request.user,
+                )
+
+                # Create general alumni forum automatically
+                from .models import Forum as ForumModel
+                import random, string
+                forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+                while ForumModel.objects.filter(forum_id=forum_id).exists():
+                    forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+                ForumModel.objects.create(
+                    forum_id=forum_id,
+                    name=f"{school.name} General Alumni Forum",
+                    description=f"General alumni forum for {school.name}",
+                    is_completed=True,
+                    is_verified=False,
+                    is_searchable=False,
+                    created_by=self.request.user,
+                    forum_type="SCHOOL_CLASS",
+                    school=school,
+                    is_general=True,
+                )
+
+            if not school:
+                raise serializers.ValidationError({"school": "School not found. Provide `school` or set `create_school` to true with school data."})
+
+            graduation_year = data.get("graduation_year") or data.get("year")
+            nickname = (data.get("nickname") or "").strip()
+            duplicate_filter = Forum.objects.filter(
+                forum_type="SCHOOL_CLASS",
+                school=school,
+                is_general=False,
+            )
+            if graduation_year:
+                duplicate_filter = duplicate_filter.filter(graduation_year=int(graduation_year))
+            else:
+                duplicate_filter = duplicate_filter.filter(graduation_year__isnull=True)
+
+            if duplicate_filter.exists():
+                existing_forum = duplicate_filter.order_by("created_at").first()
+                existing_payload = {
+                    "id": str(existing_forum.id),
+                    "name": existing_forum.name,
+                    "forum_id": existing_forum.forum_id,
+                    "school_name": existing_forum.school.name if existing_forum.school else "",
+                    "graduation_year": existing_forum.graduation_year,
+                    "contact_person": existing_forum.contact_person or "",
+                }
+                raise DuplicateForumError(
+                    "A school class forum already exists for this school and graduation year. Please join the existing forum instead.",
+                    existing_payload,
+                )
+
+            # Create the class forum
+            import random, string
+            forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+            while Forum.objects.filter(forum_id=forum_id).exists():
+                forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+            name = data.get("name") or (f"Class of {graduation_year}" if graduation_year else f"{school.name} Class Forum")
+
+            forum = Forum.objects.create(
+                forum_id=forum_id,
+                name=name,
+                description=data.get("description") or "",
+                address=data.get("address") or school.address or "",
+                email=data.get("email") or "",
+                phone=data.get("phone") or "",
+                is_completed=True,
+                is_verified=False,
+                is_searchable=True,
+                created_by=self.request.user,
+                forum_type="SCHOOL_CLASS",
+                school=school,
+                graduation_year=(int(graduation_year) if graduation_year else None),
+                nickname=nickname,
+                is_general=False,
+            )
+
+            # Creator becomes a founding moderator of the class forum
+            ForumMembership.objects.create(user=self.request.user, forum=forum, role="MOD1", is_active=True)
+
+            # Create wallet for forum (payments app)
+            try:
+                from payments.models import ForumWallet
+                ForumWallet.objects.create(forum=forum)
+            except Exception:
+                pass
+
+            return ForumSerializer(forum, context={"request": self.request}).data
+
+        # Fallback: organization forum creation uses serializer as before
         forum = serializer.save(created_by=self.request.user)
 
-        # Creator automatically becomes Sole Admin
+        # Creator automatically becomes a founding moderator (not president)
         ForumMembership.objects.create(
             user=self.request.user,
             forum=forum,
-            role="SA",
+            role="MOD1",
+            is_active=True,
         )
 
-        # Create wallet for forum (from wallet app)
+        # Create wallet for forum (payments app)
         try:
-            from wallet.models import ForumWallet
+            from payments.models import ForumWallet
             ForumWallet.objects.create(forum=forum)
-        except:
+        except Exception:
             pass
+
+        return ForumSerializer(forum, context={"request": self.request}).data
 
 
 # Complete Forum Profile
@@ -68,12 +236,14 @@ class CompletForumView(APIView):
     def put(self, request, forum_id):
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is the creator
+        # Allow forum creator or any executive (non-MEMBER active role) to complete profile
         if forum.created_by != request.user:
-            return Response(
-                {"error": "Only forum creator can complete profile"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            membership = ForumMembership.objects.filter(user=request.user, forum=forum, is_active=True).first()
+            if not membership or not membership.is_executive:
+                return Response(
+                    {"error": "Only forum creator or executives can complete profile"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         serializer = ForumCompleteSerializer(forum, data=request.data, partial=True)
         if serializer.is_valid():
@@ -83,6 +253,148 @@ class CompletForumView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class ForumVerificationRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
+
+    def post(self, request, forum_id):
+        forum = get_object_or_404(Forum, id=forum_id)
+        membership = ForumMembership.objects.filter(user=request.user, forum=forum, is_active=True).first()
+        if forum.created_by != request.user and (not membership or not membership.is_executive):
+            return Response(
+                {"error": "Only forum creator or executives can request verification."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if ForumVerificationRequest.objects.filter(forum=forum, status="PENDING").exists():
+            return Response(
+                {"error": "A verification request is already pending for this forum."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = ForumVerificationRequestSerializer(data=request.data)
+        if serializer.is_valid():
+            verification_request = serializer.save(
+                forum=forum,
+                requested_by=request.user,
+                fee_amount=forum.verification_fee_amount,
+            )
+            return Response(ForumVerificationRequestSerializer(verification_request).data, status=status.HTTP_201_CREATED)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ForumVerificationRequestListView(generics.ListAPIView):
+    serializer_class = ForumVerificationRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        forum_id = self.kwargs.get("forum_id")
+        forum = get_object_or_404(Forum, id=forum_id)
+
+        if _is_forum_admin(self.request.user):
+            return ForumVerificationRequest.objects.filter(forum=forum).order_by("-created_at")
+
+        membership = ForumMembership.objects.filter(user=self.request.user, forum=forum, is_active=True).first()
+        if forum.created_by == self.request.user or (membership and membership.is_executive):
+            return ForumVerificationRequest.objects.filter(forum=forum).order_by("-created_at")
+
+        return ForumVerificationRequest.objects.none()
+
+
+class VerifyForumView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, forum_id):
+        forum = get_object_or_404(Forum, id=forum_id)
+
+        if not _is_forum_admin(request.user):
+            return Response({"error": "Only platform administrators can verify forums."}, status=status.HTTP_403_FORBIDDEN)
+
+        action = (request.data.get("action") or "verify").lower()
+        request_id = request.data.get("verification_request_id")
+
+        if action == "verify":
+            if not request_id:
+                return Response({"error": "verification_request_id is required for approval."}, status=status.HTTP_400_BAD_REQUEST)
+
+            verification_request = get_object_or_404(ForumVerificationRequest, id=request_id, forum=forum)
+            if verification_request.status != "PENDING":
+                return Response(
+                    {"error": "Verification request must be pending to approve."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            fee_amount = verification_request.fee_amount or forum.verification_fee_amount or Decimal("0.00")
+            if fee_amount > Decimal("0.00"):
+                try:
+                    from payments.models import ForumWallet, PaymentUserWallet
+                    from payments.models import WalletService
+
+                    forum_wallet = ForumWallet.objects.select_for_update().get(forum=forum)
+                    if forum_wallet.balance < fee_amount:
+                        return Response(
+                            {"error": "Insufficient forum wallet balance to pay verification fee."},
+                            status=status.HTTP_402_PAYMENT_REQUIRED,
+                        )
+
+                    admin_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
+                    WalletService.transfer_forum_to_user(
+                        forum_wallet,
+                        admin_wallet,
+                        fee_amount,
+                        reason="Forum verification fee",
+                        reference=f"VERIF-{forum.id}-{verification_request.id}",
+                    )
+                except ForumWallet.DoesNotExist:
+                    return Response(
+                        {"error": "Forum wallet not found."},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+                except Exception as exc:
+                    return Response(
+                        {"error": str(exc)},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            forum.is_verified = True
+            forum.verification_expires_at = timezone.now() + timedelta(days=365)
+            forum.save(update_fields=["is_verified", "verification_expires_at"])
+
+            verification_request.status = "APPROVED"
+            verification_request.reviewed_by = request.user
+            verification_request.reviewed_at = timezone.now()
+            verification_request.review_notes = request.data.get("review_notes", "")
+            verification_request.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_notes"])
+
+            return Response({
+                "id": str(forum.id),
+                "is_verified": forum.is_verified,
+                "verification_expires_at": forum.verification_expires_at,
+            })
+
+        if action in ("reject", "deny"):
+            if not request_id:
+                return Response({"error": "verification_request_id is required for rejection."}, status=status.HTTP_400_BAD_REQUEST)
+
+            verification_request = get_object_or_404(ForumVerificationRequest, id=request_id, forum=forum)
+            verification_request.status = "REJECTED"
+            verification_request.reviewed_by = request.user
+            verification_request.reviewed_at = timezone.now()
+            verification_request.review_notes = request.data.get("review_notes", "")
+            verification_request.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_notes"])
+
+            return Response({"id": str(verification_request.id), "status": verification_request.status})
+
+        if action in ("unverify", "revoke"):
+            forum.is_verified = False
+            forum.verification_expires_at = None
+            forum.save(update_fields=["is_verified", "verification_expires_at"])
+            return Response({"id": str(forum.id), "is_verified": forum.is_verified})
+
+        return Response({"error": "Invalid action. Use 'verify', 'reject', or 'unverify'."}, status=status.HTTP_400_BAD_REQUEST)
+
+
 # Search Forums by Forum ID or Name
 class SearchForumsView(generics.ListAPIView):
     serializer_class = ForumSerializer
@@ -90,15 +402,49 @@ class SearchForumsView(generics.ListAPIView):
 
     def get_queryset(self):
         query = self.request.query_params.get("q", "").strip()
-        
-        if not query:
-            return Forum.objects.filter(is_searchable=True)
-        
-        # Search by forum_id first (exact match), then by name
-        return Forum.objects.filter(
-            Q(forum_id__iexact=query) | Q(name__icontains=query),
-            is_searchable=True
-        ).order_by('-created_at')
+        state = self.request.query_params.get("state", "").strip()
+        lga = self.request.query_params.get("lga", "").strip()
+        town = self.request.query_params.get("town", "").strip()
+        country = self.request.query_params.get("country", "").strip()
+
+        if not (query or state or lga or town or country):
+            return Forum.objects.none()
+
+        queryset = Forum.objects.filter(is_searchable=True)
+
+        if query:
+            queryset = queryset.filter(
+                Q(forum_id__iexact=query)
+                | Q(forum_id__icontains=query)
+                | Q(name__icontains=query)
+                | Q(nickname__icontains=query)
+                | Q(school__name__icontains=query)
+                | Q(school__id__iexact=query)
+            )
+
+            # Also include all class forums linked to matching schools
+            try:
+                from alumni.models import School
+                school_qs = School.objects.filter(Q(name__icontains=query) | Q(id__iexact=query))
+                if school_qs.exists():
+                    school_forums = Forum.objects.filter(school__in=school_qs, is_searchable=True)
+                    queryset = queryset | school_forums
+            except Exception:
+                pass
+
+        if state:
+            queryset = queryset.filter(state__icontains=state)
+
+        if lga:
+            queryset = queryset.filter(lga__icontains=lga)
+
+        if town:
+            queryset = queryset.filter(town__icontains=town)
+
+        if country:
+            queryset = queryset.filter(country__icontains=country)
+
+        return queryset.order_by('-created_at')
 
 
 # List My Forums (ANY LOGGED-IN USER CAN VIEW)
@@ -121,7 +467,7 @@ class ForumPreviewView(APIView):
     def get(self, request, forum_id):
         """Get forum preview by public forum_id"""
         forum = get_object_or_404(Forum, forum_id=forum_id)
-        serializer = ForumSerializer(forum)
+        serializer = ForumSerializer(forum, context={"request": request})
         return Response(serializer.data)
 
 
@@ -133,9 +479,9 @@ class JoinForumView(APIView):
         forum_id = request.data.get("forum_id")  # Public forum ID
         invitation_code = request.data.get("invitation_code")
         
-        if not forum_id or not invitation_code:
+        if not forum_id:
             return Response(
-                {"error": "forum_id and invitation_code are required"},
+                {"error": "forum_id is required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -162,28 +508,58 @@ class JoinForumView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Validate invitation code
-        inv_code = get_object_or_404(ForumInvitationCode, code=invitation_code, forum=forum)
-        
-        if not inv_code.can_be_used():
-            return Response(
-                {"error": "Invitation code is invalid, expired, or has reached its usage limit"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        try:
+            settings = forum.settings
+        except Exception:
+            settings = None
 
-        # Create join request
+        join_mode = getattr(settings, "join_mode", "REQUEST") if settings else "REQUEST"
+
+        invitation_code = request.data.get("invitation_code")
+
+        if join_mode == "OPEN":
+            membership = ForumMembership.objects.create(
+                user=request.user,
+                forum=forum,
+                role="MEMBER",
+            )
+            serializer = ForumMembershipSerializer(membership, context={"request": request})
+            return Response({"status": "APPROVED", "membership": serializer.data}, status=status.HTTP_201_CREATED)
+
+        if join_mode == "INVITE":
+            if not invitation_code:
+                return Response(
+                    {"error": "This forum requires an invitation code to join."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            inv_code = get_object_or_404(ForumInvitationCode, code=invitation_code, forum=forum)
+            if not inv_code.can_be_used():
+                return Response(
+                    {"error": "Invitation code is invalid, expired, or has reached its usage limit"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            inv_code.current_usage_count += 1
+            inv_code.save()
+
+            membership = ForumMembership.objects.create(
+                user=request.user,
+                forum=forum,
+                role="MEMBER",
+            )
+            serializer = ForumMembershipSerializer(membership, context={"request": request})
+            return Response({"status": "APPROVED", "membership": serializer.data}, status=status.HTTP_201_CREATED)
+
+        # Default to REQUEST if join_mode is REQUEST or missing.
         join_request = ForumJoinRequest.objects.create(
             user=request.user,
             forum=forum,
-            invitation_code=invitation_code,
+            invitation_code=invitation_code or "",
             status="PENDING"
         )
 
-        # Increment code usage
-        inv_code.current_usage_count += 1
-        inv_code.save()
-
-        serializer = ForumJoinRequestSerializer(join_request)
+        serializer = ForumJoinRequestSerializer(join_request, context={"request": request})
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 # Approve/Reject Join Request (Admin only)
 class ReviewJoinRequestView(APIView):
@@ -193,26 +569,38 @@ class ReviewJoinRequestView(APIView):
         join_request = get_object_or_404(ForumJoinRequest, id=request_id)
         action = request.data.get("action")  # "approve" or "reject"
 
-        # Check if user is forum admin
+        # Check if user is a forum moderator or admin
         membership = get_object_or_404(
             ForumMembership,
             user=request.user,
-            forum=join_request.forum
+            forum=join_request.forum,
+            is_active=True
         )
 
-        if membership.role not in ["SA", "CP"]:
+        if not membership.is_executive:
             return Response(
-                {"error": "Only forum admins can review requests"},
+                {"error": "Only forum moderators or admins can review requests"},
                 status=status.HTTP_403_FORBIDDEN
             )
 
         if action == "approve":
-            # Create membership
-            ForumMembership.objects.create(
+            membership, created = ForumMembership.objects.get_or_create(
                 user=join_request.user,
                 forum=join_request.forum,
-                role="MEMBER"
+                defaults={"role": "MEMBER", "is_active": True}
             )
+
+            if not created:
+                if not membership.is_active:
+                    membership.is_active = True
+                    membership.role = "MEMBER"
+                    membership.save(update_fields=["is_active", "role"])
+                else:
+                    return Response(
+                        {"error": "User is already a member of this forum."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
             join_request.status = "APPROVED"
             message = "Join request approved"
         elif action == "reject":
@@ -228,7 +616,7 @@ class ReviewJoinRequestView(APIView):
         join_request.reviewed_at = timezone.now()
         join_request.save()
 
-        serializer = ForumJoinRequestSerializer(join_request)
+        serializer = ForumJoinRequestSerializer(join_request, context={"request": request})
         return Response({"message": message, "request": serializer.data})
 
 
@@ -262,10 +650,12 @@ class ToggleForumSearchabilityView(APIView):
         forum = get_object_or_404(Forum, id=forum_id)
 
         if forum.created_by != request.user:
-            return Response(
-                {"error": "Only forum creator can change searchability"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            membership = ForumMembership.objects.filter(user=request.user, forum=forum, is_active=True).first()
+            if not membership or not membership.is_executive:
+                return Response(
+                    {"error": "Only forum creator or executives can change searchability"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         forum.is_searchable = not forum.is_searchable
         forum.save()
@@ -298,14 +688,15 @@ class GenerateInvitationCodeView(APIView):
         """
         forum = get_object_or_404(Forum, id=forum_id)
 
-        # Check if user is forum admin
+        # Check if user is a core executive of the forum
         membership = get_object_or_404(
             ForumMembership,
             user=request.user,
-            forum=forum
+            forum=forum,
+            is_active=True
         )
 
-        if membership.role not in ["SA", "CP"]:
+        if not membership.is_core_executive:
             return Response(
                 {"error": "Only forum admins can generate invitation codes"},
                 status=status.HTTP_403_FORBIDDEN
@@ -358,13 +749,14 @@ class ForumInvitationCodesView(generics.ListAPIView):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
 
-        # Check if user is forum admin
+        # Check if user is a core executive or legacy admin of the forum
         membership = ForumMembership.objects.filter(
             user=self.request.user,
-            forum=forum
+            forum=forum,
+            is_active=True
         ).first()
 
-        if not membership or membership.role not in ["SA", "CP"]:
+        if not membership or not membership.is_core_executive:
             return ForumInvitationCode.objects.none()
 
         return ForumInvitationCode.objects.filter(forum=forum).order_by('-created_at')
@@ -379,13 +771,14 @@ class DeleteInvitationCodeView(APIView):
         forum = get_object_or_404(Forum, id=forum_id)
         code = get_object_or_404(ForumInvitationCode, id=code_id, forum=forum)
 
-        # Check if user is forum admin
+        # Check if user is a core executive o
         membership = ForumMembership.objects.filter(
             user=request.user,
-            forum=forum
+            forum=forum,
+            is_active=True
         ).first()
 
-        if not membership or membership.role not in ["SA", "CP"]:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {"error": "Only forum admins can delete invitation codes"},
                 status=status.HTTP_403_FORBIDDEN
@@ -407,6 +800,29 @@ class MyProfileRingsView(generics.ListAPIView):
         return ProfileRing.objects.filter(
             membership__user=self.request.user
         )
+
+
+class VerifyForumView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, forum_id):
+        forum = get_object_or_404(Forum, id=forum_id)
+        # Allow creator or any executive to verify/unverify forum
+        if forum.created_by != request.user:
+            membership = ForumMembership.objects.filter(user=request.user, forum=forum, is_active=True).first()
+            if not membership or not membership.is_executive:
+                return Response({"error": "Only forum creator or executives can verify forums."}, status=status.HTTP_403_FORBIDDEN)
+
+        action = (request.data.get("action") or "verify").lower()
+        if action == "verify":
+            forum.is_verified = True
+        elif action in ("unverify", "revoke"):
+            forum.is_verified = False
+        else:
+            return Response({"error": "Invalid action. Use 'verify' or 'unverify'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        forum.save(update_fields=["is_verified"])
+        return Response({"id": str(forum.id), "is_verified": forum.is_verified})
 
 # ==================== FORUM DETAIL WITH ROLE ====================
 class ForumDetailView(generics.RetrieveAPIView):
@@ -471,8 +887,8 @@ class ForumPostViewSet(viewsets.ModelViewSet):
             user=request.user,
             forum_id=forum_id
         ).first()
-        # Allow admins or the post author to pin/unpin
-        is_admin = membership and membership.role in ["SA", "CP"]
+        # Allow core executives or the post author to pin/unpin
+        is_admin = membership and membership.is_core_executive
         if not is_admin and post.author != request.user:
             return Response(
                 {"error": "Only admins or the post author can pin posts"},
@@ -578,12 +994,13 @@ class ForumMeetingViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
-        # Check if user is admin
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=self.request.user,
-            forum=forum
+            forum=forum,
+            is_active=True
         ).first()
-        if not membership or membership.role not in ["SA", "CP"]:
+        if not membership or not membership.is_core_executive:
             raise PermissionError("Only admins can create meetings")
         serializer.save(created_by=self.request.user, forum=forum)
 
@@ -623,7 +1040,7 @@ class ForumPaymentViewSet(viewsets.ModelViewSet):
             user=self.request.user,
             forum=forum
         ).first()
-        if not membership or membership.role not in ["SA", "CP", "FSEC"]:
+        if not membership or not membership.is_core_executive:
             raise PermissionError("Only admins can create payments")
         serializer.save(created_by=self.request.user, forum=forum)
 
@@ -659,7 +1076,7 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         # If user is admin of the forum, return all announcements
         try:
             membership = ForumMembership.objects.filter(user=user, forum_id=forum_id, is_active=True).first()
-            if membership and membership.role in ["SA", "CP", "VC", "SEC", "FSEC"]:
+            if membership and membership.is_core_executive:
                 return base_qs.order_by('-created_at')
         except Exception:
             pass
@@ -692,16 +1109,14 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is admin
-        admin_roles = ["SA", "CP", "VC", "SEC", "FSEC"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only admins can create announcements'},
                 status=status.HTTP_403_FORBIDDEN
@@ -801,16 +1216,14 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
 
-        # Check if user is admin
-        admin_roles = ["SA", "CP", "VC", "SEC", "FSEC"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only admins can archive announcements'},
                 status=status.HTTP_403_FORBIDDEN
@@ -835,16 +1248,14 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
 
         forum = get_object_or_404(Forum, id=forum_id)
 
-        # Check if user is admin
-        admin_roles = ["SA", "CP", "VC", "SEC", "FSEC"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only admins can view recipients list'},
                 status=status.HTTP_403_FORBIDDEN
@@ -885,9 +1296,8 @@ class AnnouncementAttachmentDownloadView(APIView):
         if not membership:
             return Response({'error': 'You are not a member of this forum'}, status=status.HTTP_403_FORBIDDEN)
 
-        # Admins can access all attachments
-        admin_roles = ["SA", "CP", "VC", "SEC", "FSEC"]
-        if membership.role in admin_roles:
+        # Core executives can access all attachments
+        if membership.is_core_executive:
             allowed = True
         else:
             # GENERAL announcements visible to all members
@@ -996,16 +1406,14 @@ class PollGroupViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is admin
-        admin_roles = ["SA", "CP"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only forum admins can create poll groups'},
                 status=status.HTTP_403_FORBIDDEN
@@ -1024,16 +1432,14 @@ class PollGroupViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is admin
-        admin_roles = ["SA", "CP"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only admins can archive poll groups'},
                 status=status.HTTP_403_FORBIDDEN
@@ -1086,16 +1492,14 @@ class PollViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is admin
-        admin_roles = ["SA", "CP"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only forum admins can create polls'},
                 status=status.HTTP_403_FORBIDDEN
@@ -1339,16 +1743,14 @@ End time: {poll.end_time}
         forum_id = self.kwargs.get("forum_id")
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is admin
-        admin_roles = ["SA", "CP"]
+        # Check if user is a core executive
         membership = ForumMembership.objects.filter(
             user=request.user,
             forum=forum,
-            role__in=admin_roles,
             is_active=True
         ).first()
 
-        if not membership:
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'Only admins can archive polls'},
                 status=status.HTTP_403_FORBIDDEN
@@ -1403,7 +1805,7 @@ class MeetingViewSet(viewsets.ModelViewSet):
             is_active=True
         ).first()
         
-        if not membership or membership.role not in ["SA", "CP"]:
+        if not membership or not membership.is_core_executive:
             return False
         return True
 
@@ -1872,16 +2274,13 @@ class ForumActivityHistoryView(APIView):
             user=request.user
         ).first()
         
-        # Admin roles list
-        ADMIN_ROLES = ["MOD", "C", "VC", "SEC", "ASEC", "FSEC", "TR", "PRO", "POI", "POII", "SA", "CP"]
-        
         if not membership:
             return Response(
                 {"error": "You are not a member of this forum"},
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        if membership.role not in ADMIN_ROLES:
+        if not membership.is_core_executive:
             return Response(
                 {"error": "Only forum admins can access general records"},
                 status=status.HTTP_403_FORBIDDEN

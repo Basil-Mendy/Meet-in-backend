@@ -19,8 +19,10 @@ def forum_wallet_view(request, forum_id):
     user_membership = ForumMembership.objects.filter(
         forum=forum,
         user=request.user,
-        role__in=['SA', 'CP', 'FSEC']
+        is_active=True
     ).first()
+    if user_membership and not user_membership.is_core_executive:
+        user_membership = None
     
     if not user_membership:
         return Response(

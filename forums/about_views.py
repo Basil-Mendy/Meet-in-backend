@@ -15,18 +15,14 @@ from .notification_service import NotificationService
 
 
 class IsForumAdmin(permissions.BasePermission):
-    """Check if user is an admin of the forum"""
+    """Check if user is an admin/executive of the forum (any non-MEMBER active role)"""
     def has_permission(self, request, view):
         forum_id = view.kwargs.get('forum_id')
         if not forum_id:
             return False
-        
-        return ForumMembership.objects.filter(
-            forum_id=forum_id,
-            user=request.user,
-            role__in=["SA", "CP"],
-            is_active=True
-        ).exists()
+
+        membership = ForumMembership.objects.filter(forum_id=forum_id, user=request.user, is_active=True).first()
+        return bool(membership and membership.is_executive)
 
 
 class ForumAboutView(views.APIView):
@@ -46,7 +42,7 @@ class ForumAboutView(views.APIView):
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        serializer = ForumAboutSerializer(forum)
+        serializer = ForumAboutSerializer(forum, context={"request": request})
         return Response(serializer.data)
 
 
@@ -61,7 +57,8 @@ class ForumInfoEditView(views.APIView):
         
         editable_fields = [
             'name', 'slogan', 'motto', 'description', 'address',
-            'email', 'phone', 'profile_picture', 'objectives_rules'
+            'email', 'phone', 'profile_picture', 'objectives_rules',
+            'join_policy'
         ]
         
         # Track which fields were updated
@@ -78,22 +75,21 @@ class ForumInfoEditView(views.APIView):
         forum.save()
         
         # Notify members if any fields were updated
-        if updated_fields:
-            try:
-                NotificationService.create_forum_notifications(
-                    forum=forum,
-                    notification_type='FORUM_INFO_UPDATED',
-                    title=f"Forum information updated in {forum.name}",
-                    message=f"The following information was updated: {', '.join(updated_fields)}",
-                    tab='about',
-                    object_id=str(forum.id),
-                    send_push=True,
-                    send_email=False,
-                )
-            except Exception as e:
-                print(f"[Notification] Failed to create forum info update notification: {e}")
+        try:
+            NotificationService.create_forum_notifications(
+                forum=forum,
+                notification_type='FORUM_INFO_UPDATED',
+                title=f"Forum information updated in {forum.name}",
+                message=f"The following information was updated: {', '.join(updated_fields)}",
+                tab='about',
+                object_id=str(forum.id),
+                send_push=True,
+                send_email=False,
+            )
+        except Exception as e:
+            print(f"[Notification] Failed to create forum info update notification: {e}")
         
-        serializer = ForumAboutSerializer(forum)
+        serializer = ForumAboutSerializer(forum, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
@@ -147,10 +143,11 @@ class ForumDocumentViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get('forum_id')
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is forum admin
-        if not ForumMembership.objects.filter(
-            forum=forum, user=request.user, role__in=["SA", "CP"], is_active=True
-        ).exists():
+        # Check if user is a core executive of the forum
+        membership = ForumMembership.objects.filter(
+            forum=forum, user=request.user, is_active=True
+        ).first()
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'You do not have permission to upload documents'},
                 status=status.HTTP_403_FORBIDDEN
@@ -168,10 +165,11 @@ class ForumDocumentViewSet(viewsets.ModelViewSet):
         forum_id = self.kwargs.get('forum_id')
         forum = get_object_or_404(Forum, id=forum_id)
         
-        # Check if user is forum admin
-        if not ForumMembership.objects.filter(
-            forum=forum, user=request.user, role__in=["SA", "CP"], is_active=True
-        ).exists():
+        # Check if user is a core executive of the forum
+        membership = ForumMembership.objects.filter(
+            forum=forum, user=request.user, is_active=True
+        ).first()
+        if not membership or not membership.is_core_executive:
             return Response(
                 {'error': 'You do not have permission to delete documents'},
                 status=status.HTTP_403_FORBIDDEN

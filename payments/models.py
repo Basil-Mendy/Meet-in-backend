@@ -66,11 +66,16 @@ class ForumPayment(models.Model):
         ("CONTRIBUTION", "Contribution"),
         ("LEVY", "Levy"),
     ]
+    LEVY_BASIS_CHOICES = [
+        ("GENDER", "Gender Based"),
+        ("AGE", "Age Based"),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="payments")
     title = models.CharField(max_length=150)
     type = models.CharField(max_length=20, choices=PAYMENT_TYPES, default="DUES")
+    levy_basis = models.CharField(max_length=20, choices=LEVY_BASIS_CHOICES, default="GENDER")
 
     # Common fields
     deadline = models.DateField(null=True, blank=True)
@@ -90,6 +95,9 @@ class ForumPayment(models.Model):
     def __str__(self):
         return f"{self.forum} - {self.title} ({self.type})"
 
+    def member_amount_for(self, user):
+        return assign_member_amount(self, user)
+
 
 class PaymentCategory(models.Model):
     CATEGORY_CHOICES = [
@@ -97,11 +105,6 @@ class PaymentCategory(models.Model):
         ("female", "Female"),
         ("below_18", "Below 18"),
         ("age_18_plus", "18 and above"),
-        ("youth", "Youth"),
-        ("mothers", "Mothers"),
-        ("fathers", "Fathers"),
-        ("junior", "Junior"),
-        ("senior", "Senior"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -157,13 +160,61 @@ class Disbursement(models.Model):
     executed_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
     amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)  # For PAY_TO_ALL type
+    selected_members = models.ManyToManyField(User, related_name="selected_disbursements", blank=True)
+
+    # Approval workflow fields for disbursements
+    president_approved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="president_approved_disbursements",
+    )
+    president_approved_at = models.DateTimeField(null=True, blank=True)
+    secretary_approved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="secretary_approved_disbursements",
+    )
+    secretary_approved_at = models.DateTimeField(null=True, blank=True)
 
     # For PAY_ALL with categories: categories will be in DisbursementCategory
-    # For PAY_SELECTED: member_ids will be provided at execution time
+    # For PAY_SELECTED: selected_members will be stored here
     # For PAY_TO_ALL: amount field is used, all members are automatically selected
+
+    ROLE_LABEL_MAP = {
+        "P": "President",
+        "SEC": "Secretary",
+    }
 
     def __str__(self):
         return f"{self.forum} - {self.title} ({self.type})"
+
+    def required_approval_roles(self):
+        roles = ForumMembership.objects.filter(
+            forum=self.forum,
+            role__in=("P", "SEC"),
+            is_active=True,
+        ).values_list("role", flat=True)
+        return set(roles)
+
+    def required_approval_role_labels(self):
+        return [self.ROLE_LABEL_MAP.get(role, role) for role in sorted(self.required_approval_roles())]
+
+    def required_approvals_pending(self):
+        pending = []
+        required = self.required_approval_roles()
+        if "P" in required and not self.president_approved_by:
+            pending.append(self.ROLE_LABEL_MAP["P"])
+        if "SEC" in required and not self.secretary_approved_by:
+            pending.append(self.ROLE_LABEL_MAP["SEC"])
+        return pending
+
+    def can_execute(self):
+        pending = self.required_approvals_pending()
+        return len(pending) == 0
 
 
 class DisbursementCategory(models.Model):
@@ -254,6 +305,84 @@ class WalletService:
             return tx
 
     @staticmethod
+    def transfer_user_to_user(source_wallet: PaymentUserWallet, dest_wallet: PaymentUserWallet, amount: Decimal, reason: str, reference: str = ""):
+        with transaction.atomic():
+            src = PaymentUserWallet.objects.select_for_update().get(pk=source_wallet.pk)
+            dst = PaymentUserWallet.objects.select_for_update().get(pk=dest_wallet.pk)
+
+            if src.balance < amount:
+                raise ValidationError("Insufficient wallet balance")
+
+            src.balance -= amount
+            dst.balance += amount
+
+            src.save()
+            dst.save()
+
+            tx = WalletTransaction.objects.create(
+                source_user_wallet=src,
+                dest_user_wallet=dst,
+                amount=amount,
+                reason=reason,
+                reference=reference,
+                forum=None
+            )
+
+            return tx
+
+    @staticmethod
+    def transfer_forum_to_forum(source_forum_wallet: ForumWallet, dest_forum_wallet: ForumWallet, amount: Decimal, reason: str, reference: str = ""):
+        with transaction.atomic():
+            src = ForumWallet.objects.select_for_update().get(pk=source_forum_wallet.pk)
+            dst = ForumWallet.objects.select_for_update().get(pk=dest_forum_wallet.pk)
+
+            if src.balance < amount:
+                raise ValidationError("Forum wallet has insufficient balance")
+
+            src.balance -= amount
+            dst.balance += amount
+
+            src.save()
+            dst.save()
+
+            tx = WalletTransaction.objects.create(
+                source_forum_wallet=src,
+                dest_forum_wallet=dst,
+                amount=amount,
+                reason=reason,
+                reference=reference,
+                forum=src.forum
+            )
+
+            return tx
+
+    @staticmethod
+    def transfer_forum_to_user(forum_wallet: ForumWallet, user_wallet: PaymentUserWallet, amount: Decimal, reason: str, reference: str = ""):
+        with transaction.atomic():
+            fw = ForumWallet.objects.select_for_update().get(pk=forum_wallet.pk)
+            uw = PaymentUserWallet.objects.select_for_update().get(pk=user_wallet.pk)
+
+            if fw.balance < amount:
+                raise ValidationError("Forum wallet has insufficient balance")
+
+            fw.balance -= amount
+            uw.balance += amount
+
+            fw.save()
+            uw.save()
+
+            tx = WalletTransaction.objects.create(
+                source_forum_wallet=fw,
+                dest_user_wallet=uw,
+                amount=amount,
+                reason=reason,
+                reference=reference,
+                forum=fw.forum
+            )
+
+            return tx
+
+    @staticmethod
     def transfer_forum_to_users(forum_wallet: ForumWallet, distributions: list, reason: str, reference: str = ""):
         """
         distributions: list of tuples (PaymentUserWallet instance, Decimal amount)
@@ -288,41 +417,44 @@ class WalletService:
 
 
 # Utility to assign member amounts for a payment
-def determine_member_category(user):
+def determine_member_category(user, basis=None):
     """
-    Determine the category for a user based on profile data.
-    Returns a list of categories that apply (may be multiple).
+    Determine the category for a user based only on the forum profile attributes in use for a levy:
+    gender or age bracket.
+    Returns a list of categories that apply.
     """
     cats = []
     profile = getattr(user, 'profile', None)
     if not profile:
         return cats
 
-    gender = (profile.gender or '').lower()
-    if gender == 'male':
-        cats.append('male')
-    elif gender == 'female':
-        cats.append('female')
+    basis = (basis or '').upper()
 
-    # Age-based categories
-    try:
-        if profile.date_of_birth:
-            today = timezone.now().date()
-            age = today.year - profile.date_of_birth.year - ((today.month, today.day) < (profile.date_of_birth.month, profile.date_of_birth.day))
-            if age < 18:
-                cats.append('below_18')
-            else:
-                cats.append('age_18_plus')
-            if 18 <= age <= 35:
-                cats.append('youth')
-            if age >= 60:
-                cats.append('senior')
-            if age < 30:
-                cats.append('junior')
-    except Exception:
-        pass
+    if basis in ('', 'GENDER'):
+        gender = (profile.gender or '').lower()
+        if gender == 'male':
+            cats.append('male')
+        elif gender == 'female':
+            cats.append('female')
 
-    # mothers/fathers not derivable reliably without profile flags; skip unless provided
+    if basis in ('', 'AGE'):
+        try:
+            if profile.date_of_birth:
+                today = timezone.now().date()
+                age = today.year - profile.date_of_birth.year - ((today.month, today.day) < (profile.date_of_birth.month, profile.date_of_birth.day))
+                if age < 18:
+                    cats.append('below_18')
+                else:
+                    cats.append('age_18_plus')
+        except Exception:
+            pass
+
+    # If a specific basis is requested, return only the corresponding categories.
+    if basis == 'GENDER':
+        return [c for c in cats if c in {'male', 'female'}]
+    if basis == 'AGE':
+        return [c for c in cats if c in {'below_18', 'age_18_plus'}]
+
     return cats
 
 
@@ -337,17 +469,25 @@ def assign_member_amount(payment: ForumPayment, user):
         # For assignment, contribution doesn't enforce amount; store min as due (user may pay more when paying)
         return Decimal(payment.min_amount or 0)
     elif payment.type == 'LEVY':
-        # find active category for user; priority: below_18, youth, male/female, age_18_plus, junior, senior
-        cats = determine_member_category(user)
-        # build priority
-        priority = ['below_18', 'youth', 'male', 'female', 'age_18_plus', 'junior', 'senior']
+        basis = (payment.levy_basis or 'GENDER').upper()
+        if basis == 'GENDER':
+            priority = ['male', 'female']
+            allowed = {'male', 'female'}
+        elif basis == 'AGE':
+            priority = ['below_18', 'age_18_plus']
+            allowed = {'below_18', 'age_18_plus'}
+        else:
+            priority = ['male', 'female', 'below_18', 'age_18_plus']
+            allowed = {'male', 'female', 'below_18', 'age_18_plus'}
+
+        cats = determine_member_category(user, basis)
         for p in priority:
             if p in cats:
                 cat = payment.categories.filter(category=p, is_active=True).first()
                 if cat:
                     return Decimal(cat.amount)
-        # Fallback: if any active category exists, choose the first
-        active = payment.categories.filter(is_active=True).first()
+
+        active = payment.categories.filter(is_active=True, category__in=list(allowed)).first()
         if active:
             return Decimal(active.amount)
         return Decimal('0.00')

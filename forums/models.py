@@ -1,7 +1,9 @@
 import uuid
+from decimal import Decimal
 from django.db import models
 from django.conf import settings
 from django.utils import timezone
+from django.core.validators import MinValueValidator
 from .utils import calculate_ring
 import random
 import string
@@ -22,8 +24,16 @@ class Forum(models.Model):
     name = models.CharField(max_length=150)
     description = models.TextField()
     address = models.CharField(max_length=255, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    lga = models.CharField(max_length=100, blank=True)
+    town = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, blank=True, default="Nigeria")
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=20, blank=True)
+    contact_person = models.CharField(max_length=255, blank=True)
+    contact_phone = models.CharField(max_length=20, blank=True)
+    contact_email = models.EmailField(blank=True)
+    join_policy = models.CharField(max_length=20, choices=[("OPEN", "Open"), ("CLOSED", "Closed")], default="CLOSED")
     
     # Profile completion fields
     profile_picture = models.ImageField(upload_to="forum_logos/", null=True, blank=True)
@@ -40,10 +50,27 @@ class Forum(models.Model):
     # Profile completion status
     is_completed = models.BooleanField(default=False)
     is_verified = models.BooleanField(default=False)
+    verification_expires_at = models.DateTimeField(null=True, blank=True)
+    verification_fee_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(0)],
+    )
     is_searchable = models.BooleanField(default=True, help_text="Allow forum to appear in searches")
     
     # Invitation system
     invitation_link = models.URLField(blank=True)  # Auto-generated upon creation
+    # New fields for school-class forums
+    FORUM_TYPE_CHOICES = [
+        ("SCHOOL_CLASS", "School Alumni Class Forum"),
+        ("ORGANIZATION", "Organization Forum"),
+    ]
+    forum_type = models.CharField(max_length=20, choices=FORUM_TYPE_CHOICES, default="ORGANIZATION")
+    school = models.ForeignKey("alumni.School", on_delete=models.SET_NULL, null=True, blank=True, related_name="class_forums")
+    graduation_year = models.PositiveIntegerField(null=True, blank=True)
+    nickname = models.CharField(max_length=128, blank=True)
+    is_general = models.BooleanField(default=False, help_text="Automatically generated general alumni forum for a school")
     
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name="created_forums")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -52,26 +79,44 @@ class Forum(models.Model):
     def __str__(self):
         return self.name
 
+    class Meta:
+        unique_together = ("school", "graduation_year", "nickname", "is_general")
+
 
 class ForumMembership(models.Model):
     ROLE_CHOICES = [
-        ("MOD", "Moderator (Creator)"),
-        ("C", "Chairman"),
-        ("VC", "Vice Chairman"),
+        ("MEMBER", "Member"),
+        ("P", "President"),
+        ("VP", "Vice President"),
         ("SEC", "Secretary"),
         ("ASEC", "Assistant Secretary"),
         ("FSEC", "Financial Secretary"),
         ("TR", "Treasurer"),
-        ("PRO", "Public Relation Officer"),
-        ("POI", "Provost I"),
-        ("POII", "Provost II"),
-        ("MEMBER", "Member"),
+        ("PRO", "Public Relations Officer"),
+        ("MOD1", "Founding Moderator 1"),
+        ("MOD2", "Founding Moderator 2"),
+        ("MOD3", "Founding Moderator 3"),
+        ("MOD4", "Founding Moderator 4"),
+        ("MOD5", "Founding Moderator 5"),
+        ("CUSTOM", "Custom Executive Office"),
     ]
+
+    EXECUTIVE_ROLE_CHOICES = {
+        "P", "VP", "SEC", "ASEC", "FSEC", "TR", "PRO",
+    }
+    FOUNDING_MODERATOR_ROLES = {
+        "MOD1", "MOD2", "MOD3", "MOD4", "MOD5",
+    }
+    CUSTOM_ROLE = "CUSTOM"
+
+    CORE_EXECUTIVE_ROLES = EXECUTIVE_ROLE_CHOICES
+    EXECUTIVE_ROLES = CORE_EXECUTIVE_ROLES | FOUNDING_MODERATOR_ROLES | {CUSTOM_ROLE}
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="memberships")
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default="MEMBER")
+    custom_office = models.CharField(max_length=64, blank=True)
     joined_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
 
@@ -82,9 +127,157 @@ class ForumMembership(models.Model):
         return f"{self.user} - {self.forum}"
     
     @property
+    def is_member(self):
+        return self.role == "MEMBER"
+
+    @property
+    def is_executive(self):
+        """Return True if membership role is any executive role."""
+        try:
+            return (self.role or "").upper() in self.EXECUTIVE_ROLES
+        except Exception:
+            return False
+
+    @property
+    def is_core_executive(self):
+        """Return True if membership role is a core executive role (P, VP, SEC, etc.)."""
+        try:
+            return (self.role or "").upper() in self.CORE_EXECUTIVE_ROLES
+        except Exception:
+            return False
+
+    @classmethod
+    def is_valid_role(cls, role):
+        return str(role or "").upper() in [choice[0] for choice in cls.ROLE_CHOICES]
+
+    @classmethod
+    def valid_roles(cls):
+        return [choice[0] for choice in cls.ROLE_CHOICES]
+
+
+class ForumVerificationRequest(models.Model):
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="verification_requests")
+    requested_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name="forum_verification_requests")
+    registration_certificate = models.FileField(upload_to="forum_verification_certs/")
+    organization_purpose = models.TextField(blank=True)
+    fee_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(0)],
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    reviewed_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_forum_verification_requests",
+    )
+    review_notes = models.TextField(blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Verification request for {self.forum.name} ({self.status})"
+
+    @property
     def is_admin(self):
-        """Check if user has admin role (any role except MEMBER)"""
-        return self.role != "MEMBER"
+        return self.is_executive
+
+    @property
+    def is_executive(self):
+        return self.role in self.EXECUTIVE_ROLES
+
+    @property
+    def is_core_executive(self):
+        return self.role in self.CORE_EXECUTIVE_ROLES
+
+    @property
+    def is_founding_moderator(self):
+        return self.role in self.FOUNDING_MODERATOR_ROLES
+
+    @property
+    def is_custom_executive(self):
+        return self.role == self.CUSTOM_ROLE and bool(self.custom_office)
+
+    @classmethod
+    def is_executive_role(cls, role):
+        return role in cls.EXECUTIVE_ROLES
+
+    @classmethod
+    def is_core_executive_role(cls, role):
+        return role in cls.CORE_EXECUTIVE_ROLES
+
+    @classmethod
+    def is_founding_moderator_role(cls, role):
+        return role in cls.FOUNDING_MODERATOR_ROLES
+
+    @classmethod
+    def is_valid_role(cls, role):
+        return role in [choice[0] for choice in cls.ROLE_CHOICES]
+
+    @classmethod
+    def moderator_roles(cls):
+        return list(cls.FOUNDING_MODERATOR_ROLES)
+
+    @classmethod
+    def valid_roles(cls):
+        return [choice[0] for choice in cls.ROLE_CHOICES]
+
+    @property
+    def effective_role_label(self):
+        if self.role == self.CUSTOM_ROLE:
+            return self.custom_office or "Custom Executive"
+        return dict(self.ROLE_CHOICES).get(self.role, self.role)
+
+    @classmethod
+    def core_executive_roles(cls):
+        return list(cls.CORE_EXECUTIVE_ROLES)
+
+    @classmethod
+    def executive_roles(cls):
+        return list(cls.EXECUTIVE_ROLES)
+
+    @classmethod
+    def founding_moderator_roles(cls):
+        return list(cls.FOUNDING_MODERATOR_ROLES)
+
+
+class ForumRoleDefinition(models.Model):
+    ROLE_TYPE_CHOICES = [
+        ("CORE_EXECUTIVE", "Core Executive"),
+        ("EXECUTIVE", "Executive"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="role_definitions")
+    name = models.CharField(max_length=80)
+    code = models.CharField(max_length=20, unique=True)
+    role_type = models.CharField(max_length=20, choices=ROLE_TYPE_CHOICES, default="EXECUTIVE")
+    permissions = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_forum_roles")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = ("forum", "name"),
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
 
 
 class ForumEmailSettings(models.Model):
@@ -743,7 +936,7 @@ class ForumSettings(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     forum = models.OneToOneField(Forum, on_delete=models.CASCADE, related_name="settings")
     visibility = models.CharField(max_length=20, choices=VISIBILITY_CHOICES, default="PUBLIC")
-    join_mode = models.CharField(max_length=20, choices=JOIN_MODE_CHOICES, default="OPEN")
+    join_mode = models.CharField(max_length=20, choices=JOIN_MODE_CHOICES, default="REQUEST")
     payment_rules = models.TextField(blank=True)
     rules_regulations = models.TextField(blank=True)
     objectives = models.TextField(blank=True)
@@ -782,6 +975,84 @@ class BankAccount(models.Model):
         if self.forum:
             return f"{self.forum} - {self.account_number}"
         return f"{self.user} - {self.account_number}"
+
+
+class InboxFavorite(models.Model):
+    """Quick-access favorites used in the inbox composer."""
+    FAVORITE_TYPE_CHOICES = [
+        ("USER", "User"),
+        ("FORUM", "Forum"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="inbox_favorites")
+    favorite_type = models.CharField(max_length=10, choices=FAVORITE_TYPE_CHOICES, default="USER")
+    favorite_user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True, related_name="favorited_by")
+    favorite_forum = models.ForeignKey(Forum, on_delete=models.CASCADE, null=True, blank=True, related_name="favorited_by")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "favorite_type", "favorite_user", "favorite_forum")
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        if self.favorite_type == "USER" and self.favorite_user:
+            return f"{self.user} -> {self.favorite_user}"
+        if self.favorite_type == "FORUM" and self.favorite_forum:
+            return f"{self.user} -> {self.favorite_forum}"
+        return f"{self.user} favorite"
+
+
+class InboxMessage(models.Model):
+    """Internal inbox messaging between users and forums."""
+    MESSAGE_TYPE_CHOICES = [
+        ("OFFICIAL", "Official"),
+        ("UNOFFICIAL", "Unofficial"),
+    ]
+
+    SENDER_TYPE_CHOICES = [
+        ("USER", "User"),
+        ("FORUM", "Forum"),
+    ]
+
+    RECIPIENT_TYPE_CHOICES = [
+        ("USER", "User"),
+        ("FORUM", "Forum"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sender_user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True, related_name="sent_inbox_messages")
+    sender_forum = models.ForeignKey(Forum, on_delete=models.CASCADE, null=True, blank=True, related_name="sent_inbox_messages")
+    recipient_user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True, related_name="received_inbox_messages")
+    recipient_forum = models.ForeignKey(Forum, on_delete=models.CASCADE, null=True, blank=True, related_name="received_inbox_messages")
+
+    sender_type = models.CharField(max_length=10, choices=SENDER_TYPE_CHOICES, default="USER")
+    recipient_type = models.CharField(max_length=10, choices=RECIPIENT_TYPE_CHOICES, default="USER")
+    message_type = models.CharField(max_length=12, choices=MESSAGE_TYPE_CHOICES, default="UNOFFICIAL")
+
+    subject = models.CharField(max_length=200, blank=True)
+    body = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        if self.recipient_user:
+            return f"{self.sender_label} -> {self.recipient_user}"
+        if self.recipient_forum:
+            return f"{self.sender_label} -> {self.recipient_forum}"
+        return f"{self.sender_label} message"
+
+    @property
+    def sender_label(self):
+        if self.sender_forum:
+            return f"Forum: {self.sender_forum.name}"
+        if self.sender_user:
+            return self.sender_user.get_full_name() or self.sender_user.email
+        return "System"
 
 
 class Announcement(models.Model):

@@ -45,12 +45,25 @@ class ForumAboutSerializer(serializers.ModelSerializer):
     bank_account = BankAccountSerializer(required=False)
     created_by_name = serializers.SerializerMethodField()
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+
+        for field_name in ["profile_picture", "logo"]:
+            file_field = getattr(instance, field_name, None)
+            if file_field and request is not None:
+                current_value = data.get(field_name)
+                if not current_value or not str(current_value).startswith("http"):
+                    data[field_name] = request.build_absolute_uri(file_field.url)
+
+        return data
+
     class Meta:
         model = Forum
         fields = [
             'id', 'forum_id', 'name', 'slogan', 'motto', 'description',
             'address', 'email', 'phone', 'profile_picture', 'logo',
-            'objectives_rules', 'is_verified', 'is_completed', 'is_searchable',
+            'objectives_rules', 'join_policy', 'is_verified', 'is_completed', 'is_searchable',
             'created_at', 'created_by', 'created_by_name',
             'settings', 'documents', 'bank_account'
         ]

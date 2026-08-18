@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import (
-    Forum, ForumMembership, ProfileRing, ForumJoinRequest, ForumInvitationCode,
+    Forum, ForumMembership, ProfileRing, ForumVerificationRequest,
+    ForumJoinRequest, ForumInvitationCode,
     ForumPost, PostReaction, PostComment, PostCommentReply,
     Meeting, MeetingParticipant, MeetingMinute,
     ForumMeeting, MeetingAttendee,
@@ -15,40 +16,115 @@ User = get_user_model()
 
 class ForumSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source="created_by.username", read_only=True)
+    school_name = serializers.CharField(source="school.name", read_only=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+
+        for field_name in ["profile_picture", "logo", "registration_certificate", "constitution"]:
+            file_field = getattr(instance, field_name, None)
+            if file_field and request is not None:
+                current_value = data.get(field_name)
+                if not current_value or not str(current_value).startswith("http"):
+                    data[field_name] = request.build_absolute_uri(file_field.url)
+
+        return data
     
     class Meta:
         model = Forum
         fields = [
-            "id", "forum_id", "name", "description", "address", "email", "phone",
+            "id", "forum_id", "forum_type", "name", "description", "address", "state", "lga", "country", "email", "phone",
+            "contact_person", "contact_phone", "contact_email", "join_policy",
             "profile_picture", "slogan", "motto", "registration_details",
             "registration_certificate", "constitution", "objectives_rules",
-            "logo", "is_completed", "is_verified", "is_searchable", "invitation_link",
+            "logo", "is_completed", "is_verified", "verification_expires_at", "verification_fee_amount", "is_searchable", "invitation_link",
+            "school", "school_name", "graduation_year", "nickname", "is_general",
             "created_by", "created_by_name", "created_at", "updated_at"
         ]
-        read_only_fields = ["id", "forum_id", "created_by", "created_by_name", "is_verified", "invitation_link", "created_at", "updated_at"]
+        read_only_fields = ["id", "forum_id", "created_by", "created_by_name", "is_verified", "verification_expires_at", "invitation_link", "created_at", "updated_at"]
+
+
+class ForumVerificationRequestSerializer(serializers.ModelSerializer):
+    requested_by_name = serializers.CharField(source="requested_by.username", read_only=True)
+    forum_name = serializers.CharField(source="forum.name", read_only=True)
+
+    class Meta:
+        model = ForumVerificationRequest
+        fields = [
+            "id", "forum", "forum_name", "requested_by", "requested_by_name",
+            "registration_certificate", "organization_purpose", "fee_amount",
+            "status", "review_notes", "reviewed_by", "reviewed_at",
+            "created_at", "updated_at"
+        ]
+        read_only_fields = [
+            "id", "forum", "forum_name", "requested_by", "requested_by_name",
+            "status", "review_notes", "reviewed_by", "reviewed_at",
+            "created_at", "updated_at"
+        ]
+
+    def validate_registration_certificate(self, value):
+        if not value:
+            raise serializers.ValidationError("Registration certificate is required")
+        return value
 
 
 class ForumCreateSerializer(serializers.ModelSerializer):
     """For creating a forum with minimal required fields"""
+    create_school = serializers.BooleanField(write_only=True, required=False, default=False)
+    school_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_address = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_country = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_state = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_lga = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_year_established = serializers.IntegerField(write_only=True, required=False)
+    school_type = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    school_badge = serializers.ImageField(write_only=True, required=False, allow_null=True)
+    organization_type = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    organization_type_other = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+
+    # Allow creating school-class forums by providing `forum_type` and `school`/`graduation_year`.
     class Meta:
         model = Forum
-        fields = ["id", "name", "description", "address", "email", "phone", "profile_picture", "forum_id"]
+        fields = [
+            "id", "forum_id", "forum_type", "name", "description", "address", "town", "email", "phone", "profile_picture", "join_policy",
+            "school", "graduation_year", "nickname",
+            "create_school", "school_name", "school_address", "school_country", "school_state", "school_lga", "school_year_established", "school_type", "school_badge",
+            "organization_type", "organization_type_other",
+        ]
         extra_kwargs = {
             "profile_picture": {"required": False},
             "forum_id": {"read_only": True},
+            "school": {"required": False},
         }
 
     def create(self, validated_data):
         import string
         import random
-        
+
+        # Remove organization metadata fields that are used only by the form
+        validated_data.pop("organization_type", None)
+        validated_data.pop("organization_type_other", None)
+        # Remove inline school creation helper fields so Model.objects.create
+        # doesn't receive unexpected kwargs.
+        validated_data.pop("create_school", None)
+        validated_data.pop("school_name", None)
+        validated_data.pop("school_address", None)
+        validated_data.pop("school_country", None)
+        validated_data.pop("school_state", None)
+        validated_data.pop("school_lga", None)
+        validated_data.pop("school_year_established", None)
+        validated_data.pop("school_type", None)
+        validated_data.pop("school_badge", None)
+
         # Generate unique forum_id (12 uppercase alphanumeric characters)
         while True:
-            forum_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
+            forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
             if not Forum.objects.filter(forum_id=forum_id).exists():
                 break
-        
-        validated_data['forum_id'] = forum_id
+
+        validated_data["forum_id"] = forum_id
         return super().create(validated_data)
 
 
@@ -85,7 +161,11 @@ class ForumJoinRequestSerializer(serializers.ModelSerializer):
 
     def get_user_profile_photo(self, obj):
         if hasattr(obj.user, 'profile') and obj.user.profile.photo:
-            return obj.user.profile.photo.url
+            photo = obj.user.profile.photo
+            request = self.context.get("request")
+            if request is not None:
+                return request.build_absolute_uri(photo.url)
+            return photo.url
         return None
 
     class Meta:
@@ -143,8 +223,14 @@ class PostCommentSerializer(serializers.ModelSerializer):
         try:
             from accounts.models import Profile
             profile = Profile.objects.get(user=obj.author)
+            profile_photo = None
+            if profile.photo:
+                profile_photo = profile.photo.url
+                request = self.context.get("request")
+                if profile_photo and request is not None and not str(profile_photo).startswith("http"):
+                    profile_photo = request.build_absolute_uri(profile_photo)
             return {
-                "profile_photo": profile.profile_photo.url if profile.profile_photo else None,
+                "profile_photo": profile_photo,
                 "phone": profile.phone,
                 "gender": profile.gender,
             }
@@ -169,8 +255,14 @@ class PostCommentReplySerializer(serializers.ModelSerializer):
         try:
             from accounts.models import Profile
             profile = Profile.objects.get(user=obj.author)
+            profile_photo = None
+            if profile.photo:
+                profile_photo = profile.photo.url
+                request = self.context.get("request")
+                if profile_photo and request is not None and not str(profile_photo).startswith("http"):
+                    profile_photo = request.build_absolute_uri(profile_photo)
             return {
-                "profile_photo": profile.profile_photo.url if profile.profile_photo else None,
+                "profile_photo": profile_photo,
                 "phone": profile.phone,
                 "gender": profile.gender,
             }
@@ -598,8 +690,14 @@ class MeetingParticipantSerializer(serializers.ModelSerializer):
         try:
             from accounts.models import Profile
             profile = Profile.objects.get(user=obj.user)
+            profile_photo = None
+            if profile.photo:
+                profile_photo = profile.photo.url
+                request = self.context.get("request")
+                if profile_photo and request is not None and not str(profile_photo).startswith("http"):
+                    profile_photo = request.build_absolute_uri(profile_photo)
             return {
-                "profile_photo": profile.profile_photo.url if profile.profile_photo else None,
+                "profile_photo": profile_photo,
                 "phone": profile.phone,
                 "gender": profile.gender,
             }
@@ -760,7 +858,7 @@ class MeetingDetailSerializer(serializers.ModelSerializer):
                 forum=obj.forum,
                 is_active=True
             )
-            return membership.role in ["SA", "CP"]  # Sole Admin or Chairperson
+            return membership.is_core_executive
         except:
             return False
     

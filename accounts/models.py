@@ -75,9 +75,12 @@ class Profile(models.Model):
 
     # Profile completion fields
     middle_name = models.CharField(max_length=50, blank=True)
+    nickname = models.CharField(max_length=50, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
     nationality = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, blank=True, default="Nigeria")
     state = models.CharField(max_length=100, blank=True)
+    lga = models.CharField(max_length=100, blank=True)
     city = models.CharField(max_length=100, blank=True)
     gender = models.CharField(max_length=20, blank=True)
 

@@ -1,3 +1,100 @@
+from django.db.models.signals import post_save, pre_delete
+from django.dispatch import receiver
+from django.utils import timezone
+
+from .models import ForumMembership, Forum
+
+
+EXECUTIVE_ROLES_FOR_GENERAL = {"P", "SEC"}
+
+
+def get_or_create_general_forum(school, created_by=None):
+    general = Forum.objects.filter(school=school, is_general=True).first()
+    if general:
+        return general
+    # create a hidden general forum
+    import random, string
+    forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+    while Forum.objects.filter(forum_id=forum_id).exists():
+        forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+    general = Forum.objects.create(
+        forum_id=forum_id,
+        name=f"{school.name} General Alumni Forum",
+        description=f"General alumni forum for {school.name}",
+        is_completed=True,
+        is_verified=False,
+        is_searchable=False,
+        created_by=created_by,
+        forum_type="SCHOOL_CLASS",
+        school=school,
+        is_general=True,
+    )
+    return general
+
+
+@receiver(post_save, sender=ForumMembership)
+def sync_general_forum_membership_on_save(sender, instance, created, **kwargs):
+    try:
+        forum = instance.forum
+        if forum.forum_type != "SCHOOL_CLASS":
+            return
+        school = forum.school
+        if not school:
+            return
+
+        # If role is executive of interest, ensure membership exists on general forum
+        if instance.role in EXECUTIVE_ROLES_FOR_GENERAL and instance.is_active:
+            general = get_or_create_general_forum(school, created_by=forum.created_by)
+            Forum.objects.filter(id=general.id)  # ensure loaded
+            # add membership if not present
+            ForumMembership.objects.get_or_create(user=instance.user, forum=general, defaults={"role": "MEMBER", "is_active": True})
+            return
+
+        # If role is not executive or is inactive, check whether the user still holds executive role in any other class forum of the school
+        user_exec_exists = ForumMembership.objects.filter(
+            user=instance.user,
+            forum__school=school,
+            forum__forum_type="SCHOOL_CLASS",
+            role__in=list(EXECUTIVE_ROLES_FOR_GENERAL),
+            is_active=True,
+        ).exclude(forum__is_general=True).exists()
+
+        if not user_exec_exists:
+            general = Forum.objects.filter(school=school, is_general=True).first()
+            if general:
+                # remove membership if exists
+                ForumMembership.objects.filter(user=instance.user, forum=general).delete()
+    except Exception:
+        # be resilient to any errors during signal handling
+        pass
+
+
+@receiver(pre_delete, sender=ForumMembership)
+def sync_general_forum_membership_on_delete(sender, instance, **kwargs):
+    try:
+        forum = instance.forum
+        if forum.forum_type != "SCHOOL_CLASS":
+            return
+        school = forum.school
+        if not school:
+            return
+
+        # If user had executive role and it's being deleted, check other execs
+        user_exec_exists = ForumMembership.objects.filter(
+            user=instance.user,
+            forum__school=school,
+            forum__forum_type="SCHOOL_CLASS",
+            role__in=list(EXECUTIVE_ROLES_FOR_GENERAL),
+            is_active=True,
+        ).exclude(forum__is_general=True).exists()
+
+        if not user_exec_exists:
+            general = Forum.objects.filter(school=school, is_general=True).first()
+            if general:
+                ForumMembership.objects.filter(user=instance.user, forum=general).delete()
+    except Exception:
+        pass
 from django.db.models.signals import post_save, post_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -597,10 +694,11 @@ def handle_forum_join_request_created(sender, instance, created, **kwargs):
         user = instance.user
         forum = instance.forum
         
-        # Get all admins and moderators for this forum
+        # Get all executive members for this forum (including founding moderators and custom executives)
         admin_members = ForumMembership.objects.filter(
             forum=forum,
-            role__in=['admin', 'moderator']
+            role__in=list(ForumMembership.EXECUTIVE_ROLES),
+            is_active=True,
         ).exclude(user=user)
         
         for membership in admin_members:

@@ -22,16 +22,42 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+def env_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-e6_#0$+#*x-6-(7hln++d+uf!7+dv5umd225(fkq3d$@x#g3c&'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Production-safe defaults that still work for local development.
+SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-me')
+DEBUG = env_bool(os.getenv('DEBUG'), True)
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0', 'localhost:8000', '127.0.0.1:8000']
+DEFAULT_ALLOWED_HOSTS = 'localhost,127.0.0.1,0.0.0.0,.vercel.app,.railway.app'
+ALLOWED_HOSTS = [
+    host.strip() for host in os.getenv('ALLOWED_HOSTS', DEFAULT_ALLOWED_HOSTS).split(',') if host.strip()
+]
+
+if not DEBUG:
+    ALLOWED_HOSTS += ['.railway.app', '.vercel.app']
+
+# Use explicit frontend origins in production; localhost is kept for development.
+DEFAULT_CORS_ORIGINS = 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000'
+CORS_ALLOWED_ORIGINS = [
+    origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', DEFAULT_CORS_ORIGINS).split(',') if origin.strip()
+]
+CORS_ALLOW_ALL_ORIGINS = DEBUG and not CORS_ALLOWED_ORIGINS
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip() for origin in os.getenv('CSRF_TRUSTED_ORIGINS', ','.join(CORS_ALLOWED_ORIGINS)).split(',') if origin.strip()
+]
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_SSL_REDIRECT = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_PRELOAD = True
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 
 
 # Application definition
@@ -51,6 +77,7 @@ INSTALLED_APPS = [
     'forums',
     'wallet',
     'payments',
+    'alumni',
 ]
 
 MIDDLEWARE = [
@@ -93,18 +120,32 @@ CHANNEL_LAYERS = {
 
 
 # Database
-# https://docs.djangoproject.com/en/6.0/ref/settings/#databases
+# Use SQLite by default for local development. PostgreSQL is only used when
+# explicitly enabled via the environment.
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME'),
-        'USER': os.getenv('DB_USER'),
-        'PASSWORD': os.getenv('DB_PASSWORD'),
-        'HOST': os.getenv('DB_HOST'),
-        'PORT': os.getenv('DB_PORT'),
+USE_POSTGRES = (
+    os.getenv('DB_ENGINE', '').lower() == 'postgresql'
+    or os.getenv('USE_POSTGRES', '').lower() in {'1', 'true', 'yes', 'y'}
+)
+
+if USE_POSTGRES:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.getenv('DB_NAME', 'meetin'),
+            'USER': os.getenv('DB_USER', 'postgres'),
+            'PASSWORD': os.getenv('DB_PASSWORD', ''),
+            'HOST': os.getenv('DB_HOST', 'localhost'),
+            'PORT': os.getenv('DB_PORT', '5432'),
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -153,7 +194,8 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Media files (User uploads)
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
@@ -161,7 +203,8 @@ MEDIA_URL = '/media/'
 
 AUTH_USER_MODEL = 'accounts.User'
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = CORS_ALLOWED_ORIGINS
+CORS_ALLOW_ALL_ORIGINS = CORS_ALLOW_ALL_ORIGINS
 
 # Email Configuration (Gmail SMTP)
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'

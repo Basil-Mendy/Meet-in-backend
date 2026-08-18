@@ -14,6 +14,9 @@ from .views import (
     ReviewJoinRequestView,
     PendingJoinRequestsView,
     ToggleForumSearchabilityView,
+    VerifyForumView,
+    ForumVerificationRequestView,
+    ForumVerificationRequestListView,
     MyProfileRingsView,
     ForumDetailView,
     ForumMyRoleView,
@@ -35,6 +38,7 @@ from .views import (
     UserNotificationPreferenceView,
     ForumActivityHistoryView,
 )
+from alumni.views import AdminCommunityForumsView
 from .membership_views import ForumMembersViewSet
 from .about_views import (
     ForumAboutView,
@@ -61,10 +65,14 @@ urlpatterns = [
     path("join-requests/<uuid:request_id>/review/", ReviewJoinRequestView.as_view(), name="review-join-request"),
     path("<uuid:forum_id>/join-requests/", PendingJoinRequestsView.as_view(), name="pending-join-requests"),
     path("<uuid:forum_id>/toggle-searchability/", ToggleForumSearchabilityView.as_view(), name="toggle-searchability"),
+    path("<uuid:forum_id>/verify/", VerifyForumView.as_view(), name="verify-forum"),
+    path("<uuid:forum_id>/verification-request/", ForumVerificationRequestView.as_view(), name="forum-verification-request"),
+    path("<uuid:forum_id>/verification-requests/", ForumVerificationRequestListView.as_view(), name="forum-verification-requests"),
     path("<uuid:forum_id>/invitation-codes/", ForumInvitationCodesView.as_view(), name="forum-invitation-codes"),
     path("<uuid:forum_id>/invitation-codes/generate/", GenerateInvitationCodeView.as_view(), name="generate-invitation-code"),
     path("<uuid:forum_id>/invitation-codes/<uuid:code_id>/", DeleteInvitationCodeView.as_view(), name="delete-invitation-code"),
     path("my-rings/", MyProfileRingsView.as_view(), name="my-profile-rings"),
+    path("admin/community-forums/", AdminCommunityForumsView.as_view(), name="admin-community-forums"),
 
     # About Tab
     path("<uuid:forum_id>/about/", ForumAboutView.as_view(), name="forum-about"),
@@ -122,6 +130,8 @@ urlpatterns = [
     path("<uuid:forum_id>/members/", ForumMembersViewSet.as_view({"get": "list"}), name="forum-members"),
     path("<uuid:forum_id>/members/<uuid:pk>/", ForumMembersViewSet.as_view({"delete": "destroy"}), name="forum-member-detail"),
     path("<uuid:forum_id>/members/<uuid:pk>/assign-role/", ForumMembersViewSet.as_view({"post": "assign_role"}), name="forum-member-assign-role"),
+    path("<uuid:forum_id>/members/custom-roles/", ForumMembersViewSet.as_view({"post": "custom_roles"}), name="forum-member-custom-roles"),
+    path("<uuid:forum_id>/members/create-custom-role/", ForumMembersViewSet.as_view({"post": "create_custom_role"}), name="forum-member-create-custom-role"),
 
     # Notifications
     path("notifications/", NotificationViewSet.as_view({"get": "list"}), name="user-notifications"),
