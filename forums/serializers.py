@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import (
-    Forum, ForumMembership, ProfileRing, ForumVerificationRequest,
+    Forum, ForumMembership, ProfileRing, ForumVerificationRequest, ForumVerificationPlan,
     ForumJoinRequest, ForumInvitationCode,
     ForumPost, PostReaction, PostComment, PostCommentReply,
     Meeting, MeetingParticipant, MeetingMinute,
@@ -15,8 +15,17 @@ from .models import (
 User = get_user_model()
 
 class ForumSerializer(serializers.ModelSerializer):
-    created_by_name = serializers.CharField(source="created_by.username", read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    join_mode = serializers.SerializerMethodField()
     school_name = serializers.CharField(source="school.name", read_only=True)
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return "Unknown"
+        return " ".join(filter(None, [obj.created_by.first_name, obj.created_by.last_name])).strip() or obj.created_by.email
+
+    def get_join_mode(self, obj):
+        return getattr(getattr(obj, "settings", None), "join_mode", "REQUEST")
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -34,7 +43,7 @@ class ForumSerializer(serializers.ModelSerializer):
     class Meta:
         model = Forum
         fields = [
-            "id", "forum_id", "forum_type", "name", "description", "address", "state", "lga", "country", "email", "phone",
+            "id", "forum_id", "forum_type", "name", "description", "address", "state", "lga", "country", "email", "phone", "join_mode",
             "contact_person", "contact_phone", "contact_email", "join_policy",
             "profile_picture", "slogan", "motto", "registration_details",
             "registration_certificate", "constitution", "objectives_rules",
@@ -53,20 +62,27 @@ class ForumVerificationRequestSerializer(serializers.ModelSerializer):
         model = ForumVerificationRequest
         fields = [
             "id", "forum", "forum_name", "requested_by", "requested_by_name",
-            "registration_certificate", "organization_purpose", "fee_amount",
+            "registration_certificate", "organization_purpose", "plan", "fee_amount",
             "status", "review_notes", "reviewed_by", "reviewed_at",
             "created_at", "updated_at"
         ]
         read_only_fields = [
             "id", "forum", "forum_name", "requested_by", "requested_by_name",
             "status", "review_notes", "reviewed_by", "reviewed_at",
-            "created_at", "updated_at"
+            "created_at", "updated_at", "fee_amount"
         ]
 
     def validate_registration_certificate(self, value):
         if not value:
             raise serializers.ValidationError("Registration certificate is required")
         return value
+
+
+class ForumVerificationPlanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ForumVerificationPlan
+        fields = ["id", "name", "duration_days", "fee_amount"]
+        read_only_fields = fields
 
 
 class ForumCreateSerializer(serializers.ModelSerializer):
@@ -118,11 +134,8 @@ class ForumCreateSerializer(serializers.ModelSerializer):
         validated_data.pop("school_type", None)
         validated_data.pop("school_badge", None)
 
-        # Generate unique forum_id (12 uppercase alphanumeric characters)
-        while True:
-            forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
-            if not Forum.objects.filter(forum_id=forum_id).exists():
-                break
+        from .models import generate_forum_id
+        forum_id = generate_forum_id()
 
         validated_data["forum_id"] = forum_id
         return super().create(validated_data)

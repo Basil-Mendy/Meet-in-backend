@@ -108,6 +108,8 @@ class InboxAccessTests(TestCase):
             first_name="Another",
             last_name="User",
         )
+        Profile.objects.filter(user=self.user).update(username="forum_exec")
+        Profile.objects.filter(user=self.other_user).update(username="another_user", is_completed=True)
         self.client = APIClient()
         self.client.force_authenticate(user=self.user)
 
@@ -118,6 +120,7 @@ class InboxAccessTests(TestCase):
             is_completed=True,
         )
         ForumMembership.objects.create(user=self.user, forum=self.forum, role="SEC", is_active=True)
+        ForumMembership.objects.create(user=self.other_user, forum=self.forum, role="MEMBER", is_active=True)
 
     def test_forum_box_returns_only_forum_related_messages(self):
         private_message = InboxMessage.objects.create(
@@ -139,7 +142,7 @@ class InboxAccessTests(TestCase):
             body="This belongs to the forum",
         )
 
-        response = self.client.get(f"/api/inbox/messages/?forum_id={self.forum.id}")
+        response = self.client.get(f"/api/inbox/messages/?forum_id={self.forum.forum_id}")
 
         self.assertEqual(response.status_code, 200)
         ids = {item["id"] for item in response.json()}
@@ -154,8 +157,8 @@ class InboxAccessTests(TestCase):
                 "body": "This is sent by the forum",
                 "message_type": "OFFICIAL",
                 "recipient_type": "USER",
-                "user_id": str(self.other_user.id),
-                "from_forum_id": str(self.forum.id),
+                "username": "another_user",
+                "from_forum_id": self.forum.forum_id,
             },
             format="json",
         )
@@ -165,3 +168,34 @@ class InboxAccessTests(TestCase):
         self.assertEqual(message.sender_type, "FORUM")
         self.assertEqual(str(message.sender_forum_id), str(self.forum.id))
         self.assertEqual(message.recipient_user, self.other_user)
+
+    def test_user_cannot_message_user_outside_shared_forum(self):
+        outsider = User.objects.create_user(
+            email="outsider@example.com",
+            password="secret123",
+            phone="08044444444",
+            first_name="Outside",
+            last_name="Member",
+        )
+        Profile.objects.filter(user=outsider).update(username="outsider")
+
+        response = self.client.post(
+            "/api/inbox/send/",
+            {
+                "body": "This must be blocked",
+                "recipient_type": "USER",
+                "username": "outsider",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_username_lookup_returns_exact_match_and_prefix_suggestions(self):
+        exact_response = self.client.get("/api/inbox/recipients/lookup/?type=USER&value=another_user")
+        self.assertEqual(exact_response.status_code, 200)
+        self.assertEqual(exact_response.json()["name"], "Another User")
+
+        prefix_response = self.client.get("/api/inbox/recipients/lookup/?type=USER&value=another")
+        self.assertEqual(prefix_response.status_code, 200)
+        self.assertEqual(prefix_response.json()["suggestions"][0]["username"], "another_user")

@@ -1,10 +1,22 @@
 from django.contrib import admin
-from .models import Forum, ForumMembership, MemberActivity, ProfileRing, Notification, UserNotificationPreference
+from .models import Forum, ForumMembership, MemberActivity, ProfileRing, Notification, UserNotificationPreference, ForumVerificationPlan, ForumVerificationRequest
 
 
 @admin.register(Forum)
 class ForumAdmin(admin.ModelAdmin):
     list_display = ("name", "is_verified", "created_by", "created_at")
+
+
+@admin.register(ForumVerificationPlan)
+class ForumVerificationPlanAdmin(admin.ModelAdmin):
+    list_display = ("name", "fee_amount", "duration_days", "is_active")
+    list_filter = ("is_active",)
+
+
+@admin.register(ForumVerificationRequest)
+class ForumVerificationRequestAdmin(admin.ModelAdmin):
+    list_display = ("forum", "plan", "fee_amount", "status", "created_at")
+    list_filter = ("status", "plan")
 
 
 @admin.register(ForumMembership)

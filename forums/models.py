@@ -13,14 +13,17 @@ User = settings.AUTH_USER_MODEL
 
 
 def generate_forum_id():
-    """Generate a unique forum ID"""
-    forum_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    return forum_id
+    """Generate a unique public forum ID in the AA0000 format."""
+    while True:
+        forum_id = ''.join(random.choices(string.ascii_uppercase, k=2))
+        forum_id += ''.join(random.choices(string.digits, k=4))
+        if not Forum.objects.filter(forum_id=forum_id).exists():
+            return forum_id
 
 
 class Forum(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    forum_id = models.CharField(max_length=20, unique=True, null=True, blank=True)  # Public forum ID for searches
+    forum_id = models.CharField(max_length=6, unique=True, default=generate_forum_id)  # Public forum ID for searches
     name = models.CharField(max_length=150)
     description = models.TextField()
     address = models.CharField(max_length=255, blank=True)
@@ -155,6 +158,21 @@ class ForumMembership(models.Model):
         return [choice[0] for choice in cls.ROLE_CHOICES]
 
 
+class ForumVerificationPlan(models.Model):
+    """Admin-managed verification billing plans."""
+    name = models.CharField(max_length=80, unique=True)
+    duration_days = models.PositiveIntegerField(default=365)
+    fee_amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["duration_days", "fee_amount"]
+
+    def __str__(self):
+        return f"{self.name} - {self.fee_amount} for {self.duration_days} days"
+
+
 class ForumVerificationRequest(models.Model):
     STATUS_CHOICES = [
         ("PENDING", "Pending"),
@@ -166,6 +184,7 @@ class ForumVerificationRequest(models.Model):
     forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name="verification_requests")
     requested_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name="forum_verification_requests")
     registration_certificate = models.FileField(upload_to="forum_verification_certs/")
+    plan = models.ForeignKey(ForumVerificationPlan, on_delete=models.PROTECT, null=True, blank=True, related_name="verification_requests")
     organization_purpose = models.TextField(blank=True)
     fee_amount = models.DecimalField(
         max_digits=10,
@@ -1053,6 +1072,20 @@ class InboxMessage(models.Model):
         if self.sender_user:
             return self.sender_user.get_full_name() or self.sender_user.email
         return "System"
+
+
+class InboxMessageAttachment(models.Model):
+    """Files attached to an inbox message."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message = models.ForeignKey(InboxMessage, on_delete=models.CASCADE, related_name="attachments")
+    file = models.FileField(upload_to="inbox_attachments/")
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=150, blank=True)
+    size = models.BigIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
 
 
 class Announcement(models.Model):

@@ -2,10 +2,16 @@ from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 
-from .models import ForumMembership, Forum
+from .models import ForumMembership, Forum, generate_forum_id
+from payments.models import ForumWallet
 
 
 EXECUTIVE_ROLES_FOR_GENERAL = {"P", "SEC"}
+
+
+@receiver(post_save, sender=Forum)
+def create_forum_wallet(sender, instance, created, **kwargs):
+    ForumWallet.objects.get_or_create(forum=instance)
 
 
 def get_or_create_general_forum(school, created_by=None):
@@ -13,10 +19,7 @@ def get_or_create_general_forum(school, created_by=None):
     if general:
         return general
     # create a hidden general forum
-    import random, string
-    forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
-    while Forum.objects.filter(forum_id=forum_id).exists():
-        forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+    forum_id = generate_forum_id()
 
     general = Forum.objects.create(
         forum_id=forum_id,

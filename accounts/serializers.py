@@ -1,5 +1,8 @@
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
+from django.utils import timezone
+from datetime import timedelta
+import re
 from .models import User, Profile
 from .models import VerificationRequest
 
@@ -42,6 +45,8 @@ class ProfileSerializer(serializers.ModelSerializer):
         fields = [
             "middle_name",
             "nickname",
+            "username",
+            "username_changed_at",
             "date_of_birth",
             "gender",
             "nationality",
@@ -54,7 +59,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             "contact_info",
             "is_completed",
         ]
-        read_only_fields = ["is_completed"]
+        read_only_fields = ["is_completed", "username_changed_at"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -69,6 +74,20 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         instance = self.instance
+        username = attrs.get("username")
+        if username is not None:
+            username = username.strip()
+            if username and not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+                raise serializers.ValidationError({"username": "Use 3-30 letters, numbers, or underscores."})
+            if username and Profile.objects.exclude(pk=getattr(instance, "pk", None)).filter(username__iexact=username).exists():
+                raise serializers.ValidationError({"username": "That username is already in use."})
+            attrs["username"] = username or None
+
+            if instance and instance.username and username != instance.username:
+                if instance.username_changed_at and instance.username_changed_at > timezone.now() - timedelta(days=30):
+                    next_change = instance.username_changed_at + timedelta(days=30)
+                    raise serializers.ValidationError({"username": f"Username can be changed again on {next_change.date().isoformat()}."})
+
         if not instance or not instance.is_completed:
             return attrs
 
@@ -99,6 +118,9 @@ class ProfileSerializer(serializers.ModelSerializer):
         return attrs
 
     def update(self, instance, validated_data):
+        username_changed = "username" in validated_data and validated_data.get("username") != instance.username
+        if username_changed:
+            validated_data["username_changed_at"] = timezone.now()
         profile = super().update(instance, validated_data)
 
         if any(k in validated_data for k in ["date_of_birth", "nationality", "country", "state", "lga", "city", "middle_name", "gender", "photo"]):
@@ -120,5 +142,5 @@ class ProfileSerializer(serializers.ModelSerializer):
 class VerificationRequestSerializer(serializers.ModelSerializer):
     class Meta:
         model = VerificationRequest
-        fields = ["id", "selfie", "id_document", "id_type", "status", "submitted_at"]
+        fields = ["id", "selfie", "id_document", "id_type", "fee_amount", "status", "submitted_at"]
         read_only_fields = ["id", "status", "submitted_at"]

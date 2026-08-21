@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import User, Profile
+from .models import User, Profile, VerificationRequest
 
 
 @admin.register(User)
@@ -35,3 +35,9 @@ class ProfileAdmin(admin.ModelAdmin):
         "nationality",
         "state",
     )
+
+
+@admin.register(VerificationRequest)
+class VerificationRequestAdmin(admin.ModelAdmin):
+    list_display = ("user", "status", "fee_amount", "submitted_at", "reviewed_at")
+    list_filter = ("status", "submitted_at")

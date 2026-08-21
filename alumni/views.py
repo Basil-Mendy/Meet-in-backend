@@ -841,6 +841,7 @@ class VerificationRequestListView(APIView):
                 "submitted_at": record.submitted_at,
                 "reviewed_at": record.reviewed_at,
                 "id_type": record.id_type,
+                "fee_amount": str(record.fee_amount),
                 "user_id": record.user.id,
                 "user_name": f"{record.user.first_name} {record.user.last_name}".strip(),
                 "user_email": record.user.email,
@@ -858,6 +859,19 @@ class VerificationRequestDecisionView(APIView):
 
         verification_request = VerificationRequest.objects.get(id=request_id)
         action = request.data.get("action", "approve")
+
+        if action == "approve" and verification_request.fee_amount:
+            from payments.models import PaymentUserWallet, WalletService
+            user_wallet, _ = PaymentUserWallet.objects.get_or_create(user=verification_request.user)
+            if user_wallet.balance < verification_request.fee_amount:
+                return Response({"detail": "Insufficient user wallet balance to pay the verification fee."}, status=status.HTTP_402_PAYMENT_REQUIRED)
+            admin_wallet, _ = PaymentUserWallet.objects.get_or_create(user=request.user)
+            WalletService.transfer_user_to_user(
+                user_wallet, admin_wallet, verification_request.fee_amount,
+                reason="Individual user verification fee",
+                reference=f"USER-VERIF-{verification_request.id}",
+            )
+
         verification_request.status = "approved" if action == "approve" else "rejected"
         verification_request.reviewed_at = datetime.now()
         verification_request.reviewed_by = request.user

@@ -58,19 +58,30 @@ class ForumInfoEditView(views.APIView):
         editable_fields = [
             'name', 'slogan', 'motto', 'description', 'address',
             'email', 'phone', 'profile_picture', 'objectives_rules',
-            'join_policy'
+            'join_policy', 'join_mode'
         ]
+
+        if 'join_mode' in request.data and request.data['join_mode'] not in {'OPEN', 'REQUEST'}:
+            return Response({'join_mode': 'Choose OPEN or REQUEST.'}, status=status.HTTP_400_BAD_REQUEST)
         
         # Track which fields were updated
         updated_fields = []
         # Only allow editing specified fields
+        join_mode = request.data.get('join_mode')
         for field in editable_fields:
+            if field == 'join_mode':
+                continue
             if field in request.data:
                 current_value = getattr(forum, field, None)
                 new_value = request.data[field]
                 if current_value != new_value:
                     updated_fields.append(field)
                 setattr(forum, field, request.data[field])
+
+        if join_mode is not None:
+            forum_settings, _ = ForumSettings.objects.get_or_create(forum=forum)
+            forum_settings.join_mode = join_mode
+            forum_settings.save(update_fields=['join_mode', 'updated_at'])
         
         forum.save()
         

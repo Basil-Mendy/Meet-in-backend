@@ -14,7 +14,7 @@ from django.http import FileResponse, Http404
 import mimetypes
 
 from .models import (
-    Forum, ForumMembership, ProfileRing, ForumVerificationRequest,
+    Forum, ForumMembership, ProfileRing, ForumVerificationRequest, ForumVerificationPlan,
     ForumJoinRequest, ForumInvitationCode,
     ForumPost, PostReaction, PostComment, PostCommentReply,
     Meeting, MeetingParticipant, MeetingMinute,
@@ -22,12 +22,12 @@ from .models import (
     ForumPayment, ForumPaymentSubmission,
     Announcement, AnnouncementRead, AnnouncementRecipient, AnnouncementAttachment,
     Poll, PollGroup, PollOption, PollVote,
-    Notification, UserNotificationPreference, ForumActivityHistory
+    Notification, UserNotificationPreference, ForumActivityHistory, generate_forum_id
 )
 from .serializers import (
     ForumSerializer, ForumCreateSerializer, ForumCompleteSerializer,
     ForumVerificationRequestSerializer,
-    ProfileRingSerializer, ForumMembershipSerializer, ForumJoinRequestSerializer, ForumInvitationCodeSerializer,
+    ProfileRingSerializer, ForumMembershipSerializer, ForumJoinRequestSerializer, ForumInvitationCodeSerializer, ForumVerificationPlanSerializer,
     ForumPostSerializer, PostReactionSerializer, PostCommentSerializer, PostCommentReplySerializer,
     MeetingListSerializer, MeetingDetailSerializer, MeetingCreateSerializer,
     MeetingParticipantSerializer, MeetingMinuteSerializer,
@@ -122,10 +122,7 @@ class CreateForumView(generics.CreateAPIView):
 
                 # Create general alumni forum automatically
                 from .models import Forum as ForumModel
-                import random, string
-                forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
-                while ForumModel.objects.filter(forum_id=forum_id).exists():
-                    forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+                forum_id = generate_forum_id()
 
                 ForumModel.objects.create(
                     forum_id=forum_id,
@@ -171,10 +168,7 @@ class CreateForumView(generics.CreateAPIView):
                 )
 
             # Create the class forum
-            import random, string
-            forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
-            while Forum.objects.filter(forum_id=forum_id).exists():
-                forum_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+            forum_id = generate_forum_id()
 
             name = data.get("name") or (f"Class of {graduation_year}" if graduation_year else f"{school.name} Class Forum")
 
@@ -202,7 +196,7 @@ class CreateForumView(generics.CreateAPIView):
             # Create wallet for forum (payments app)
             try:
                 from payments.models import ForumWallet
-                ForumWallet.objects.create(forum=forum)
+                ForumWallet.objects.get_or_create(forum=forum)
             except Exception:
                 pass
 
@@ -222,7 +216,7 @@ class CreateForumView(generics.CreateAPIView):
         # Create wallet for forum (payments app)
         try:
             from payments.models import ForumWallet
-            ForumWallet.objects.create(forum=forum)
+            ForumWallet.objects.get_or_create(forum=forum)
         except Exception:
             pass
 
@@ -272,16 +266,38 @@ class ForumVerificationRequestView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        plan_id = request.data.get("plan")
+        plan = ForumVerificationPlan.objects.filter(id=plan_id, is_active=True).first() if plan_id else None
+        if not plan:
+            return Response({"error": "Select an active verification billing plan."}, status=status.HTTP_400_BAD_REQUEST)
+
+        forum_name = (request.data.get("forum_name") or "").strip()
+        forum_address = (request.data.get("forum_address") or "").strip()
+        if not forum_name or not forum_address:
+            return Response({"error": "Forum name and address are required."}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = ForumVerificationRequestSerializer(data=request.data)
         if serializer.is_valid():
+            forum.name = forum_name
+            forum.address = forum_address
+            forum.save(update_fields=["name", "address", "updated_at"])
             verification_request = serializer.save(
                 forum=forum,
                 requested_by=request.user,
-                fee_amount=forum.verification_fee_amount,
+                plan=plan,
+                fee_amount=plan.fee_amount,
             )
             return Response(ForumVerificationRequestSerializer(verification_request).data, status=status.HTTP_201_CREATED)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ForumVerificationPlansView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ForumVerificationPlanSerializer
+
+    def get_queryset(self):
+        return ForumVerificationPlan.objects.filter(is_active=True)
 
 
 class ForumVerificationRequestListView(generics.ListAPIView):
@@ -357,9 +373,11 @@ class VerifyForumView(APIView):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
+            duration_days = verification_request.plan.duration_days if verification_request.plan else 365
+            forum.verification_fee_amount = fee_amount
             forum.is_verified = True
-            forum.verification_expires_at = timezone.now() + timedelta(days=365)
-            forum.save(update_fields=["is_verified", "verification_expires_at"])
+            forum.verification_expires_at = timezone.now() + timedelta(days=duration_days)
+            forum.save(update_fields=["is_verified", "verification_expires_at", "verification_fee_amount"])
 
             verification_request.status = "APPROVED"
             verification_request.reviewed_by = request.user
@@ -513,7 +531,7 @@ class JoinForumView(APIView):
         except Exception:
             settings = None
 
-        join_mode = getattr(settings, "join_mode", "REQUEST") if settings else "REQUEST"
+        join_mode = getattr(getattr(forum, "settings", None), "join_mode", "REQUEST")
 
         invitation_code = request.data.get("invitation_code")
 

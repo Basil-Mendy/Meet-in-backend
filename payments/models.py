@@ -9,13 +9,29 @@ from forums.models import Forum, ForumMembership
 User = settings.AUTH_USER_MODEL
 
 
+def generate_wallet_number(prefix):
+    """Generate a unique human-readable wallet number."""
+    import secrets
+
+    model = ForumWallet if prefix == "FW" else PaymentUserWallet
+    while True:
+        candidate = f"{prefix}{secrets.randbelow(10**10):010d}"
+        if not model.objects.filter(wallet_number=candidate).exists():
+            return candidate
+
+
 class ForumWallet(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     forum = models.OneToOneField(Forum, on_delete=models.CASCADE, related_name="wallet")
     balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
     # Optional wallet number that may be issued by us or a partner financial institution
-    wallet_number = models.CharField(max_length=64, null=True, blank=True, unique=False)
+    wallet_number = models.CharField(max_length=64, unique=True, default="", editable=False)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if not self.wallet_number:
+            self.wallet_number = generate_wallet_number("FW")
+        super().save(*args, **kwargs)
 
 
 class PaymentUserWallet(models.Model):
@@ -23,8 +39,13 @@ class PaymentUserWallet(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="payment_wallet")
     balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
     # Optional wallet number for user wallets (human/bank-friendly identifier)
-    wallet_number = models.CharField(max_length=64, null=True, blank=True, unique=False)
+    wallet_number = models.CharField(max_length=64, unique=True, default="", editable=False)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if not self.wallet_number:
+            self.wallet_number = generate_wallet_number("UW")
+        super().save(*args, **kwargs)
 
 
 class WalletTransaction(models.Model):

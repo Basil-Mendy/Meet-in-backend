@@ -76,6 +76,8 @@ class Profile(models.Model):
     # Profile completion fields
     middle_name = models.CharField(max_length=50, blank=True)
     nickname = models.CharField(max_length=50, blank=True)
+    username = models.CharField(max_length=30, unique=True, null=True, blank=True)
+    username_changed_at = models.DateTimeField(null=True, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
     nationality = models.CharField(max_length=100, blank=True)
     country = models.CharField(max_length=100, blank=True, default="Nigeria")
@@ -108,6 +110,7 @@ class VerificationRequest(models.Model):
     selfie = models.ImageField(upload_to="verifications/selfies/", null=True, blank=True)
     id_document = models.FileField(upload_to="verifications/ids/", null=True, blank=True)
     id_type = models.CharField(max_length=50, blank=True)
+    fee_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
     submitted_at = models.DateTimeField(auto_now_add=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
